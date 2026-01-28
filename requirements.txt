@@ -1,0 +1,42 @@
+# Backend Req: Common in all environments:
+ipykernel==6.29.5
+langchain==0.3.25
+langchain-community==0.3.24
+langchain-core==0.3.60
+langchain-text-splitters==0.3.8
+PyMuPDF==1.25.5
+unstructured==0.17.2
+Markdown==3.8
+
+fastapi==0.115.12
+uvicorn==0.34.2
+python-multipart==0.0.20
+qdrant-client==1.12.1
+pytz==2025.2
+bcrypt==4.3.0
+psycopg2-binary==2.9.9
+redis==5.2.1
+celery==5.4.0  # Async background task processing
+flower==2.0.1  # Celery monitoring and administration UI
+
+# Retrieval Enhancements:
+torch>=2.0.0  # PyTorch for Qwen3 reranker inference
+transformers>=4.40.0  # Hugging Face transformers for Qwen3-Reranker-0.6B
+
+
+# Backend Req: One of these two as per your convenience:
+# I have used ollama for 'dev' and google-genai for 'deploy'
+langchain-ollama==0.3.3
+langchain-google-genai==2.1
+
+
+# Others:
+# python:
+#       => "3.12.0"
+#       => "3.12.*" in general
+# ollama embeddings 
+#       => "mxbai-embeddings-large" (tested and used)
+#       => "nomic-embed-text" (if low on GPU memory / CPU inferencing)
+# ollama llm models 
+#       => "gemma3:latest" or "gemma3:4b" (both are same)(tested, used)
+#       => "gemma3:1b" (if you're low on GPU memory / CPU inferencing)

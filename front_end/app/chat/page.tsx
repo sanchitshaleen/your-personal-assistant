@@ -1,0 +1,442 @@
+'use client';
+
+import { useState, useEffect, useRef } from 'react';
+import { useRouter } from 'next/navigation';
+import { fileApi, chatApi } from '@/lib/api';
+import { FiSend, FiPlus, FiMenu, FiX, FiChevronDown, FiDatabase } from 'react-icons/fi';
+import toast, { Toaster } from 'react-hot-toast';
+import Sidebar from '@/components/Sidebar';
+
+interface Message {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  files?: string[];
+  timestamp: Date;
+  duration?: number; // Response duration in seconds
+  chunks?: any[]; // Retrieved document chunks
+  retrievalTime?: number; // Retrieval time in seconds
+  breakdown?: any; // Timing breakdown
+}
+
+interface Conversation {
+  id: string;
+  title: string;
+  messages: Message[];
+  createdAt: Date;
+}
+
+export default function ChatPage() {
+  const router = useRouter();
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [currentConversation, setCurrentConversation] = useState<Conversation | null>(null);
+  const [files, setFiles] = useState<string[]>([]);
+  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
+  const [query, setQuery] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [isInitialized, setIsInitialized] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [showFileDropdown, setShowFileDropdown] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  
+  // Use a fixed user_id for single-user mode
+  const USER_ID = 'default_user';
+  
+  useEffect(() => {
+    fetchFiles();
+    loadConversations();
+    setIsInitialized(true);
+  }, []);
+  
+  // Create initial conversation only after loading is complete and no conversations exist
+  useEffect(() => {
+    if (isInitialized && conversations.length === 0 && !currentConversation) {
+      createNewConversation();
+    }
+  }, [isInitialized, conversations.length, currentConversation]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [currentConversation?.messages]);
+
+  const fetchFiles = async () => {
+    try {
+      const response = await fileApi.getUploads(USER_ID);
+      setFiles(
+        response.files
+          .filter((f: any) => f.available === 1)
+          .map((f: any) => f.filename)
+      );
+    } catch (error) {
+      toast.error('Failed to load files');
+    }
+  };
+
+  const loadConversations = () => {
+    // Load from localStorage for now
+    const saved = localStorage.getItem(`conversations_${USER_ID}`);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      setConversations(parsed);
+      if (parsed.length > 0) {
+        setCurrentConversation(parsed[0]);
+      }
+    }
+  };
+
+  const createNewConversation = () => {
+    const newConv: Conversation = {
+      id: Date.now().toString(),
+      title: 'New Chat',
+      messages: [],
+      createdAt: new Date(),
+    };
+    setConversations([newConv, ...conversations]);
+    setCurrentConversation(newConv);
+    setSelectedFiles(new Set());
+  };
+
+  const saveConversations = (convs: Conversation[]) => {
+    localStorage.setItem(`conversations_${USER_ID}`, JSON.stringify(convs));
+  };
+
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!query.trim()) return;
+    
+    // Auto-create conversation if none exists
+    let activeConv = currentConversation;
+    if (!activeConv) {
+      activeConv = {
+        id: Date.now().toString(),
+        title: 'New Chat',
+        messages: [],
+        createdAt: new Date(),
+      };
+      setCurrentConversation(activeConv);
+      setConversations([activeConv, ...conversations]);
+    }
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: query,
+      files: Array.from(selectedFiles),
+      timestamp: new Date(),
+    };
+
+    setIsLoading(true);
+    try {
+      const updatedConv = {
+        ...activeConv,
+        messages: [...activeConv.messages, userMessage],
+      };
+      setCurrentConversation(updatedConv);
+      setQuery('');
+
+      // Update title if it's still "New Chat"
+      let finalConv = updatedConv;
+      if (updatedConv.title === 'New Chat' && query.length > 0) {
+        finalConv = {
+          ...updatedConv,
+          title: query.substring(0, 50),
+        };
+      }
+
+      // Use streaming RAG chat with selected files
+      let assistantContent = '';
+      const assistantMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: '',
+        timestamp: new Date(),
+      };
+
+      // Add assistant message placeholder
+      finalConv = {
+        ...finalConv,
+        messages: [...finalConv.messages, assistantMessage],
+      };
+      setCurrentConversation(finalConv);
+
+      // Stream the response
+      const result = await chatApi.ragChat(
+        query,
+        USER_ID,
+        Array.from(selectedFiles),
+        (chunk: string) => {
+          assistantContent += chunk;
+          assistantMessage.content = assistantContent;
+          setCurrentConversation({
+            ...finalConv,
+            messages: [...finalConv.messages.slice(0, -1), assistantMessage],
+          });
+        }
+      );
+
+      // Add duration to the message
+      if (result.duration) {
+        assistantMessage.duration = result.duration;
+      }
+      
+      // Add chunks and timing info
+      if (result.chunks) {
+        assistantMessage.chunks = result.chunks;
+      }
+      if (result.retrievalTime) {
+        assistantMessage.retrievalTime = result.retrievalTime;
+      }
+      if (result.breakdown) {
+        assistantMessage.breakdown = result.breakdown;
+      }
+
+      // Save final conversation
+      finalConv = {
+        ...finalConv,
+        messages: [...finalConv.messages.slice(0, -1), assistantMessage],
+      };
+      setCurrentConversation(finalConv);
+
+      const updatedConvs = conversations.map((c) =>
+        c.id === finalConv.id ? finalConv : c
+      );
+      setConversations(updatedConvs);
+      saveConversations(updatedConvs);
+    } catch (error) {
+      toast.error('Failed to send message');
+      // Remove the user message on error
+      if (currentConversation) {
+        const updatedConv = {
+          ...currentConversation,
+          messages: currentConversation.messages.slice(0, -1),
+        };
+      setCurrentConversation(updatedConv);
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    // No authentication in single-user mode
+    router.push('/');
+  };
+
+  const toggleFileSelection = (filename: string) => {
+    const newSelected = new Set(selectedFiles);
+    if (newSelected.has(filename)) {
+      newSelected.delete(filename);
+    } else {
+      newSelected.add(filename);
+    }
+    setSelectedFiles(newSelected);
+  };
+
+  return (
+    <div className="flex w-full h-screen bg-white">
+      <Sidebar />
+      
+      <main className="flex-1 flex flex-col h-screen relative">
+        <Toaster />
+        
+        {/* Top Header */}
+        <header className="h-16 border-b border-gray-200 flex items-center justify-between px-6 bg-white z-10">
+            <div className="flex items-center gap-2 text-sm text-gray-500 cursor-pointer hover:bg-gray-50 p-2 rounded-lg">
+                <div className="w-5 h-5 rounded bg-green-600" /> 
+                <span className="font-medium text-gray-700">Gemma-3</span>
+                <FiChevronDown />
+            </div>
+            
+            <button 
+                onClick={() => router.push('/dashboard')}
+                className="flex items-center gap-2 px-3 py-1.5 bg-white border border-gray-200 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-50 transition shadow-sm"
+            >
+                <FiDatabase className="text-green-600"/>
+                Local Documents
+            </button>
+        </header>
+
+        {/* Messaging Area */}
+        <div className="flex-1 overflow-y-auto px-4 py-6 scroll-smooth">
+           {!currentConversation || currentConversation.messages.length === 0 ? (
+               <div className="h-full flex flex-col items-center justify-center text-gray-300 pb-20">
+                   <h1 className="text-4xl font-bold text-gray-800 mb-8 tracking-tight">SiloQ</h1>
+                   
+                    <div className="grid grid-cols-2 gap-4 max-w-2xl w-full px-8">
+                        {['Explain the project structure', 'Summarize latest logs', 'How do I add a new model?', 'Debug connection issues'].map((starter) => (
+                             <button 
+                                key={starter}
+                                onClick={() => setQuery(starter)}
+                                className="p-4 bg-white border border-gray-200 rounded-xl text-left text-sm text-gray-600 hover:border-green-500 hover:shadow-sm transition"
+                             >
+                                {starter}
+                             </button>
+                        ))}
+                    </div>
+               </div>
+           ) : (
+               <div className="max-w-3xl mx-auto space-y-6">
+                   {currentConversation.messages.map((msg) => (
+                       <div key={msg.id} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                           {msg.role === 'assistant' && (
+                               <div className="w-8 h-8 rounded-full bg-green-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0 mt-1">
+                                   AI
+                               </div>
+                           )}
+                           <div className={`max-w-[85%] rounded-2xl px-5 py-3 ${
+                               msg.role === 'user' 
+                               ? 'bg-gray-100 text-gray-900 rounded-tr-none' 
+                               : 'bg-white text-gray-800'
+                           }`}>
+                               <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+                               {msg.files && msg.files.length > 0 && (
+                                   <div className="mt-2 pt-2 border-t border-gray-200/50 flex gap-2 flex-wrap">
+                                        {msg.files.map(f => (
+                                            <span key={f} className="text-xs text-gray-500 bg-gray-50 px-2 py-1 rounded border border-gray-200">
+                                                📄 {f}
+                                            </span>
+                                        ))}
+                                   </div>
+                               )}
+                               {msg.role === 'assistant' && msg.chunks && msg.chunks.length > 0 && (
+                                   <div className="mt-3 pt-3 border-t border-gray-200/50">
+                                       <details className="text-xs">
+                                           <summary className="cursor-pointer text-gray-500 hover:text-gray-700 font-medium mb-2">
+                                               📚 Retrieved {msg.chunks.length} document chunks ({msg.retrievalTime?.toFixed(2)}s)
+                                           </summary>
+                                           <div className="space-y-2 mt-2">
+                                               {msg.chunks.map((chunk: any, idx: number) => (
+                                                   <div key={idx} className="bg-gray-50 rounded p-3 border border-gray-200">
+                                                       <div className="flex items-start gap-2 mb-2">
+                                                           <span className="font-mono text-green-600 font-bold text-sm">#{chunk.rank}</span>
+                                                           <div className="flex-1">
+                                                               <div className="flex items-center gap-2 mb-1">
+                                                                   <span className="text-blue-600 font-medium">📄 {chunk.source || chunk.filename}</span>
+                                                               </div>
+                                                               {chunk.filename !== chunk.source && chunk.filename !== 'unknown' && (
+                                                                   <span className="text-gray-500 text-xs">Chunk: {chunk.filename}</span>
+                                                               )}
+                                                           </div>
+                                                       </div>
+                                                       <p className="text-gray-700 leading-relaxed">
+                                                           {chunk.content}
+                                                       </p>
+                                                   </div>
+                                               ))}
+                                           </div>
+                                       </details>
+                                   </div>
+                               )}
+                               {msg.role === 'assistant' && msg.duration && (
+                                   <div className="mt-2 pt-2 border-t border-gray-200/50">
+                                       <span className="text-xs text-gray-400">
+                                           ⏱️ Response time: {msg.duration.toFixed(1)}s
+                                           {msg.breakdown && (
+                                               <span className="ml-2">
+                                                   (retrieval: {msg.breakdown.retrieval}s, LLM: {msg.breakdown.llm}s)
+                                               </span>
+                                           )}
+                                       </span>
+                                   </div>
+                               )}
+                           </div>
+                       </div>
+                   ))}
+                   <div ref={messagesEndRef} />
+                   {isLoading && (
+                       <div className="flex gap-4">
+                           <div className="w-8 h-8 rounded-full bg-green-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0 animate-pulse">
+                               AI
+                           </div>
+                           <div className="text-gray-500 italic text-sm py-2">
+                               Thinking...
+                           </div>
+                       </div>
+                   )}
+               </div>
+           )}
+        </div>
+
+        {/* Input Area */}
+        <div className="p-4 bg-white">
+            <div className="max-w-3xl mx-auto relative group">
+                {selectedFiles.size > 0 && (
+                    <div className="absolute -top-12 left-0 flex gap-2 overflow-x-auto w-full pb-2 px-1">
+                        {Array.from(selectedFiles).map(f => (
+                            <div key={f} className="flex items-center gap-1 text-xs bg-green-50 text-green-700 px-3 py-1.5 rounded-full border border-green-100 whitespace-nowrap shadow-sm">
+                                <span className="truncate max-w-[150px]">{f}</span>
+                                <button onClick={() => toggleFileSelection(f)} className="hover:text-green-900 ml-1">×</button>
+                            </div>
+                        ))}
+                    </div>
+                )}
+                
+                <form onSubmit={handleSendMessage} className="relative shadow-sm rounded-2xl border border-gray-300 focus-within:ring-1 focus-within:ring-green-500 focus-within:border-green-500 transition-all bg-white">
+                    <input
+                        className="w-full py-4 pl-4 pr-32 bg-transparent outline-none text-gray-700 placeholder-gray-400 rounded-2xl"
+                        placeholder="Send a message..."
+                        value={query}
+                        onChange={(e) => setQuery(e.target.value)}
+                        disabled={isLoading}
+                    />
+                    
+                    <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-2">
+                         <div className="relative">
+                            <button
+                                type="button"
+                                onClick={() => setShowFileDropdown(!showFileDropdown)}
+                                className={`p-2 rounded-lg transition ${selectedFiles.size > 0 ? 'text-green-600 bg-green-50' : 'text-gray-400 hover:text-gray-600'}`}
+                                title="Attach Local Documents"
+                            >
+                                <FiDatabase size={18} />
+                            </button>
+                            
+                            {showFileDropdown && (
+                                <div className="absolute bottom-full right-0 mb-4 w-72 bg-white rounded-xl shadow-2xl border border-gray-100 p-3 max-h-80 overflow-y-auto z-20">
+                                    <div className="flex justify-between items-center mb-2 px-1">
+                                        <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Your Documents</h3>
+                                        <button onClick={() => router.push('/dashboard')} className="text-xs text-green-600 hover:underline">+ Add Folder</button>
+                                    </div>
+                                    {files.length === 0 ? (
+                                        <div className="text-center py-4">
+                                            <p className="text-xs text-gray-400">No documents found.</p>
+                                        </div>
+                                    ) : (
+                                        <div className="space-y-1">
+                                            {files.map(file => (
+                                                <div 
+                                                    key={file} 
+                                                    className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer text-sm transition ${selectedFiles.has(file) ? 'bg-green-50 text-green-800' : 'hover:bg-gray-50 text-gray-700'}`}
+                                                    onClick={() => toggleFileSelection(file)}
+                                                >
+                                                    <div className={`w-4 h-4 rounded border flex items-center justify-center transition ${selectedFiles.has(file) ? 'bg-green-500 border-green-500' : 'border-gray-300'}`}>
+                                                        {selectedFiles.has(file) && <div className="w-2 h-2 bg-white rounded-sm" />}
+                                                    </div>
+                                                    <span className="truncate flex-1">{file}</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                         </div>
+
+                        <button
+                            type="submit"
+                            disabled={!query.trim() || isLoading}
+                            className={`p-2 rounded-lg transition shadow-sm ${!query.trim() || isLoading ? 'bg-gray-100 text-gray-400' : 'bg-green-600 text-white hover:bg-green-700'}`}
+                        >
+                            <FiSend size={18} />
+                        </button>
+                    </div>
+                </form>
+                <div className="text-center mt-3 text-xs text-gray-400 font-light">
+                    SiloQ can make mistakes. Please review critical information.
+                </div>
+            </div>
+        </div>
+      </main>
+    </div>
+  );
+}
+

@@ -1,0 +1,261 @@
+version: '3.9'
+
+services:
+  # PostgreSQL Database for user authentication
+  postgres:
+    image: postgres:16-alpine
+    container_name: chat-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: chat_db
+    ports:
+      - "5440:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - chat_network
+
+  # Redis for caching and session management
+  redis:
+    image: redis:8.0-alpine
+    container_name: chat-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - chat_network
+
+  # Redis Commander Web UI for Redis (basic key/value viewer)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: chat-redis-commander
+    platform: linux/amd64
+    ports:
+      - "8082:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    depends_on:
+      - redis
+    networks:
+      - chat_network
+
+  # RedisInsight Web UI for Redis (advanced monitoring, live MONITOR stream, CLI)
+  redisinsight:
+    image: redislabs/redisinsight:latest
+    container_name: chat-redisinsight
+    platform: linux/amd64
+    ports:
+      - "8083:5540"
+    depends_on:
+      - redis
+    volumes:
+      - redisinsight_data:/db
+    networks:
+      - chat_network
+
+  # Qdrant Vector Database for embeddings
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: chat-qdrant
+    ports:
+      - "6335:6333"
+      - "6336:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT_API_KEY: ""
+    healthcheck:
+      test: ["CMD-SHELL", "[ -z \"$(timeout 1 bash -c 'echo >/dev/tcp/127.0.0.1/6333' 2>&1)\" ] && echo 0 || echo 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - chat_network
+
+  # Ollama for LLM and embeddings (requires GPU/significant resources)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: chat-ollama
+    ports:
+      - "11435:11434"
+    environment:
+      - OLLAMA_MODELS=/root/.ollama/models
+    volumes:
+      - ollama_data:/root/.ollama
+    # Note: GPU acceleration on Apple Silicon (M1/M2/M3) is automatically handled by Ollama
+    # No need for nvidia runtime on ARM-based systems
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - chat_network
+
+  # FastAPI Backend Server
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - ENV_TYPE=dev
+    container_name: chat-fastapi
+    ports:
+      - "8002:8000"
+    environment:
+      - MODE=dev
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=chat_db
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/fastAPI:/fastAPI/server
+      - SEMANTIC_CACHE_ENABLED=true
+      - SEMANTIC_CACHE_SIMILARITY_THRESHOLD=0.85
+      - SEMANTIC_CACHE_TTL_SECONDS=86400
+      - SEMANTIC_CACHE_MAX_PER_USER=100
+      - USE_BM25_SEMANTIC_HYBRID=true
+      - BM25_WEIGHT=0.5
+      - SEMANTIC_WEIGHT=0.5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      # ollama: Using native Ollama on host machine for GPU acceleration
+      # condition: service_started
+    volumes:
+      - ./src:/fastAPI/src
+      - ./config:/fastAPI/config
+      - ./user_uploads:/fastAPI/user_uploads
+      - ./scripts:/fastAPI/scripts
+
+    working_dir: /fastAPI
+    command: bash /fastAPI/scripts/init_ollama.sh
+    networks:
+      - chat_network
+
+  # Celery Worker for async background tasks
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - ENV_TYPE=dev
+    container_name: chat-celery-worker
+    environment:
+      - MODE=dev
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=chat_db
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/fastAPI:/fastAPI/server
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - USE_BM25_SEMANTIC_HYBRID=true
+      - BM25_WEIGHT=0.5
+      - SEMANTIC_WEIGHT=0.5
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    volumes:
+      - ./src:/fastAPI/src
+      - ./config:/fastAPI/config
+      - ./user_uploads:/fastAPI/user_uploads
+
+    working_dir: /fastAPI
+    command: celery -A src.worker worker --loglevel=info --concurrency=1 -E
+    mem_limit: 7g
+    memswap_limit: 8g
+    networks:
+      - chat_network
+
+  # Flower Monitoring UI for Celery
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - ENV_TYPE=dev
+    container_name: chat-flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - redis
+      - celery-worker
+    command: celery -A src.worker flower --port=5555 --broker=redis://redis:6379/0
+    networks:
+      - chat_network
+
+
+  # Modern Next.js Frontend
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: chat-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_URL=http://localhost:8002
+    depends_on:
+      - fastapi
+    volumes:
+      - ./front_end:/app
+      - /app/node_modules
+      - /app/.next
+    working_dir: /app
+    command: npm run dev
+    networks:
+      - chat_network
+
+volumes:
+  postgres_data:
+  redis_data:
+  redisinsight_data:
+  qdrant_data:
+  ollama_data:
+
+networks:
+  chat_network:
+    driver: bridge
