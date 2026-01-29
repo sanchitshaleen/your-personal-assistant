@@ -167,6 +167,39 @@ export default function DashboardPage() {
         }
     };
 
+    const handleFileUpload = async (fileList: FileList) => {
+         if (!fileList) return;
+
+         const files = Array.from(fileList).filter(file => {
+            const ext = file.name.split('.').pop()?.toLowerCase();
+            return ['pdf', 'txt', 'md'].includes(ext || '');
+         });
+
+         if (files.length === 0) {
+             toast.error("No valid files selected. Supported: PDF, TXT, MD");
+             return;
+         }
+
+         setUploadProgress({ step: 1, total: files.length, message: 'Starting upload...', percentage: 0 });
+
+         let processed = 0;
+         for (const file of files) {
+             setUploadProgress({ 
+                 step: processed + 1, 
+                 total: files.length, 
+                 message: `Uploading ${file.name}...`, 
+                 percentage: Math.round((processed / files.length) * 100) 
+             });
+             
+             await processFile(file);
+             processed++;
+         }
+
+         setUploadProgress(null);
+         toast.success(`Uploaded ${files.length} file(s). Processing in background.`);
+         fetchFiles();
+    };
+
     const handleFolderUpload = async (fileList: FileList) => {
          if (!fileList) return;
 
@@ -240,6 +273,25 @@ export default function DashboardPage() {
             fetchFiles();
         } catch (error: any) {
              toast.error(error.message || 'Rebuild failed');
+        }
+    };
+
+    const handleDeleteAll = async () => {
+        if (!confirm(`⚠️ DELETE ALL FILES?\n\nThis will permanently delete all ${files.length} files and their embeddings.\n\nThis action cannot be undone!`)) return;
+        
+        try {
+            toast.loading('Deleting all files...');
+            const res = await fileApi.deleteAllFiles(USER_ID);
+            toast.dismiss();
+            toast.success(`Deleted ${res.files_deleted} files and ${res.embeddings_deleted} embeddings`);
+            
+            // Clear local state
+            setTaskMap({});
+            setProgressMap({});
+            fetchFiles();
+        } catch (error: any) {
+            toast.dismiss();
+            toast.error(error.message || 'Delete all failed');
         }
     };
 
@@ -395,18 +447,40 @@ export default function DashboardPage() {
                             </select>
 
                             {files.length > 0 && (
-                                <button
-                                    onClick={handleReembedAll}
-                                    className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition flex items-center gap-2 font-medium shadow-sm"
-                                    title="Re-embed all files with selected model"
-                                >
-                                    <FiRefreshCw />
-                                    Re-embed All
-                                </button>
+                                <>
+                                    <button
+                                        onClick={handleDeleteAll}
+                                        className="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 transition flex items-center gap-2 font-medium shadow-sm"
+                                        title="Delete all files and embeddings"
+                                    >
+                                        <FiTrash2 />
+                                        Delete All
+                                    </button>
+                                    <button
+                                        onClick={handleReembedAll}
+                                        className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition flex items-center gap-2 font-medium shadow-sm"
+                                        title="Re-embed all files with selected model"
+                                    >
+                                        <FiRefreshCw />
+                                        Re-embed All
+                                    </button>
+                                </>
                             )}
 
                             <label className="bg-green-600 text-white px-4 py-2 rounded-lg cursor-pointer hover:bg-green-700 transition flex items-center gap-2 font-medium shadow-sm">
-                                <FiUpload />
+                                <FiFileText />
+                                Add Files
+                                <input 
+                                    type="file" 
+                                    className="hidden" 
+                                    multiple
+                                    accept=".pdf,.txt,.md"
+                                    onChange={(e) => e.target.files && handleFileUpload(e.target.files)} 
+                                />
+                            </label>
+
+                            <label className="bg-green-700 text-white px-4 py-2 rounded-lg cursor-pointer hover:bg-green-800 transition flex items-center gap-2 font-medium shadow-sm">
+                                <FiFolder />
                                 Add Folder
                                 <input 
                                     type="file" 

@@ -420,6 +420,25 @@ async def rag_chat(request: Request, chat_request: RAGChatRequest):
     """
     session_id = chat_request.session_id.strip() or "default_user"
     
+    def is_greeting(query: str) -> bool:
+        greetings = [
+            "hi", "hello", "hey", "how are you", "good morning", "good afternoon", "good evening",
+            "greetings", "what's up", "yo", "sup", "howdy", "hola", "namaste", "bonjour", "hallo", "ciao"
+        ]
+        q = query.strip().lower()
+        return any(q == g or q.startswith(g + ' ') or q.endswith(' ' + g) or q in g for g in greetings)
+
+    def is_general_knowledge_question(query: str) -> bool:
+        # Add more patterns as needed for your use case
+        general_patterns = [
+            "weather", "temperature", "news", "sports", "score", "stock", "market", "currency", "exchange rate",
+            "president", "prime minister", "capital of", "population of", "time in", "date today", "today's date",
+            "who is", "what is", "when is", "where is", "how is", "tell me about", "latest", "current"
+        ]
+        q = query.strip().lower()
+        # If the query contains any of these patterns and does not mention uploaded files, treat as general
+        return any(p in q for p in general_patterns)
+
     async def rag_streamer():
         import time
         start_time = time.time()
@@ -428,10 +447,10 @@ async def rag_chat(request: Request, chat_request: RAGChatRequest):
             query = chat_request.query
             selected_files = chat_request.selected_files
             dummy = chat_request.dummy
-            
+
             s = 'dummy' if dummy else 'real'
             log.info(f"/rag {s} response requested by '{session_id}' with files: {selected_files}")
-            
+
             # Send metadata first
             yield json.dumps({
                 "type": "metadata",
@@ -440,7 +459,47 @@ async def rag_chat(request: Request, chat_request: RAGChatRequest):
                     "selected_files": selected_files
                 }
             }) + "\n"
-            
+
+            # Handle greetings/small talk directly
+            if is_greeting(query):
+                greeting_response = "Hello! How can I help you today?"
+                for char in greeting_response:
+                    if await request.is_disconnected():
+                        log.warning(f"/rag client disconnected for '{session_id}' (greeting)")
+                        break
+                    yield json.dumps({
+                        "type": "content",
+                        "data": char
+                    }) + "\n"
+                    await asyncio.sleep(0.01)
+                # Add to history
+                history_store: HistoryStore = request.app.state.history_store
+                history_store.add_interaction(session_id, query, greeting_response)
+                log.info(f"/rag Greeting response completed for '{session_id}'")
+                return
+
+            # Handle general knowledge/open domain questions
+            if is_general_knowledge_question(query):
+                polite_response = (
+                    "Sorry, I don’t have access to real-time or general world information. "
+                    "I can only answer questions based on the documents you’ve uploaded. "
+                    "Please ask something related to your uploaded files."
+                )
+                for char in polite_response:
+                    if await request.is_disconnected():
+                        log.warning(f"/rag client disconnected for '{session_id}' (general knowledge)")
+                        break
+                    yield json.dumps({
+                        "type": "content",
+                        "data": char
+                    }) + "\n"
+                    await asyncio.sleep(0.01)
+                # Add to history
+                history_store: HistoryStore = request.app.state.history_store
+                history_store.add_interaction(session_id, query, polite_response)
+                log.info(f"/rag General knowledge response completed for '{session_id}'")
+                return
+
             if dummy:
                 # Dummy response
                 dummy_text = "This is a dummy RAG response for testing."
@@ -450,26 +509,26 @@ async def rag_chat(request: Request, chat_request: RAGChatRequest):
                         "data": char
                     }) + "\n"
                     await asyncio.sleep(0.05)
-                
+
                 yield json.dumps({
                     "type": "sources",
                     "data": {"files": selected_files if selected_files else []}
                 }) + "\n"
-                
+
                 log.info(f"/rag Dummy streaming completed for '{session_id}'")
                 return
-            
+
             # Check if the query is about conversation history
             llm_check = request.app.state.llm_chat
             is_history_query = await is_conversation_history_question(query, llm_check)
-            
+
             if is_history_query:
                 # Handle conversation history query without RAG
                 log.info(f"/rag Detected conversation history question for '{session_id}'")
                 history_store: HistoryStore = request.app.state.history_store
                 history_messages = history_store.get_history(session_id)
                 answer = get_conversation_answer(history_messages, query)
-                
+
                 for char in answer:
                     if await request.is_disconnected():
                         log.warning(f"/rag client disconnected for '{session_id}'")
@@ -479,7 +538,7 @@ async def rag_chat(request: Request, chat_request: RAGChatRequest):
                         "data": char
                     }) + "\n"
                     await asyncio.sleep(0.01)
-                
+
                 # Add to history
                 history_store.add_interaction(session_id, query, answer)
                 log.info(f"/rag Conversation history response completed for '{session_id}'")
@@ -552,20 +611,23 @@ async def rag_chat(request: Request, chat_request: RAGChatRequest):
             try:
                 async for chunk in rag_chain.astream({"input": query}, config=config):
                     chunk_count += 1
+                    print(f"[DEBUG] LLM chunk #{chunk_count} raw: {chunk}")
                     if chunk_count == 1:
                         print(f"[DEBUG] First LLM chunk received")
                     if await request.is_disconnected():
                         log.warning(f"/rag client disconnected for '{session_id}'")
                         break
-                    
                     # Extract answer from chunk
                     if isinstance(chunk, dict) and "answer" in chunk:
                         content = chunk["answer"]
+                        print(f"[DEBUG] LLM chunk #{chunk_count} content: {content[:100]}")
                         full_response += content
+                        print(f"[DEBUG] Yielding LLM chunk #{chunk_count} to client")
                         yield json.dumps({
                             "type": "content",
-                        "data": content
-                    }) + "\n"
+                            "data": content
+                        }) + "\n"
+                        print(f"[DEBUG] Yielded LLM chunk #{chunk_count} to client")
             except Exception as stream_error:
                 print(f"[ERROR] LLM streaming error: {stream_error}")
                 log.error(f"/rag LLM streaming error: {stream_error}", exc_info=True)
@@ -934,12 +996,26 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Form(...)):
                 source_created_at=source_created_at,
                 source='manual'
             )
+            
+            # Auto-trigger embedding task after successful upload
+            try:
+                task = ingest_file_task.delay(user_id=user_id, file_name=filename)
+                log.info(f"/upload Auto-triggered embedding task {task.id} for {filename}")
+                embedding_status = "embedding_queued"
+                task_id = task.id
+            except Exception as embed_err:
+                log.error(f"/upload Failed to queue embedding task: {str(embed_err)}", exc_info=True)
+                embedding_status = "embedding_failed"
+                task_id = None
+            
             return JSONResponse(
                 content={
                     "message": filename,
                     "file_size": file_size,
                     "file_type": file_type,
-                    "status": "uploaded"
+                    "status": "uploaded",
+                    "embedding_status": embedding_status,
+                    "task_id": task_id
                 },
                 status_code=200
             )
@@ -1008,6 +1084,81 @@ async def get_uploads(user_id: str = Query(...)):
         log.error(f"/uploads Error: {e}", exc_info=True)
         return JSONResponse(
             content={"error": f"Failed to fetch uploads: {str(e)}"},
+            status_code=500
+        )
+
+
+@app.delete("/delete_all_files")
+async def delete_all_files_endpoint(user_id: str = Query(...)):
+    """Delete all files and embeddings for a user."""
+    log.info(f"/delete_all_files Deleting all files for user '{user_id}'")
+    
+    try:
+        # Get all files for the user
+        user_files = pg_db.get_files_by_user(user_id)
+        
+        if not user_files:
+            log.info(f"/delete_all_files No files found for user '{user_id}'")
+            return JSONResponse(
+                content={
+                    "status": "success",
+                    "message": "No files to delete",
+                    "files_deleted": 0,
+                    "embeddings_deleted": 0
+                },
+                status_code=200
+            )
+        
+        total_files = len(user_files)
+        total_embeddings = 0
+        failed_files = []
+        
+        vs: VectorDB = app.state.vector_db
+        
+        for file_record in user_files:
+            file_id = file_record['id']
+            filename = file_record['filename']
+            
+            try:
+                # Get embedding IDs for this file
+                embedding_ids = pg_db.get_embeddings_by_file_id(file_id)
+                total_embeddings += len(embedding_ids)
+                
+                # Delete from Qdrant
+                if embedding_ids:
+                    try:
+                        vs.delete_documents(embedding_ids)
+                        pg_db.mark_embeddings_removed(embedding_ids)
+                    except Exception as ve:
+                        log.error(f"/delete_all_files Error deleting vectors for '{filename}': {ve}")
+                
+                # Delete physical file
+                files.delete_file(user_id=user_id, file_name=filename)
+                
+                # Mark file as removed in database
+                pg_db.mark_file_removed(user_id=user_id, file_id=file_id)
+                
+            except Exception as e:
+                log.error(f"/delete_all_files Error deleting '{filename}': {e}")
+                failed_files.append(filename)
+        
+        log.info(f"/delete_all_files Deleted {total_files - len(failed_files)}/{total_files} files for user '{user_id}'")
+        
+        return JSONResponse(
+            content={
+                "status": "success",
+                "message": f"Deleted {total_files - len(failed_files)} files",
+                "files_deleted": total_files - len(failed_files),
+                "embeddings_deleted": total_embeddings,
+                "failed_files": failed_files
+            },
+            status_code=200
+        )
+        
+    except Exception as e:
+        log.error(f"/delete_all_files Error: {e}", exc_info=True)
+        return JSONResponse(
+            content={"error": f"Failed to delete files: {str(e)}"},
             status_code=500
         )
 
@@ -1397,11 +1548,14 @@ async def delete_model(name: str):
             status_code=500
         )
 
-# Simple in-memory storage for active models (runtime only for now)
-active_models = {
-    "llm": "gemma3:2b",
-    "embedding": "nomic-embed-text:v1.5"
-}
+# Get active models from config
+def get_active_models():
+    return {
+        "llm": config.LLM_CHAT_MODEL_NAME,
+        "embedding": config.EMB_MODEL_NAME
+    }
+
+active_models = get_active_models()
 
 @app.post("/models/select")
 async def select_model(req: ModelSelectRequest):
@@ -1467,48 +1621,74 @@ async def select_model(req: ModelSelectRequest):
 # Update the existing /models endpoint to include active status
 @app.get("/models")
 async def get_models_v2():
+    import sys
+    print("[DEBUG] ===== get_models_v2 CALLED =====", file=sys.stderr, flush=True)
     try:
         import urllib.request
         import json
+        import os
+        import sys
+        
+        # Get Ollama URL from config
+        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+        ollama_url = f"{ollama_base_url}/api/tags"
+        
+        print(f"[DEBUG] Fetching models from Ollama at: {ollama_url}", file=sys.stderr, flush=True)
         
         # 1. Fetch models from Ollama
         models_list_raw = []
         try:
-            # Connect to Ollama (assuming default port)
-            ollama_url = "http://localhost:11434/api/tags"
-            with urllib.request.urlopen(ollama_url) as response:
+            req = urllib.request.Request(ollama_url, method='GET')
+            with urllib.request.urlopen(req, timeout=5) as response:
                 if response.status == 200:
                     data = json.loads(response.read().decode())
                     models_list_raw = data.get("models", [])
+                    print(f"[DEBUG] Successfully fetched {len(models_list_raw)} models from Ollama", file=sys.stderr, flush=True)
                 else:
-                    log.error(f"Ollama API returned status: {response.status}")
+                    print(f"[ERROR] Ollama API returned status: {response.status}", file=sys.stderr, flush=True)
         except Exception as e:
-            log.error(f"Failed to connect to Ollama at {ollama_url}: {e}")
-            # Don't fail completely, just return empty list or cached
+            print(f"[ERROR] Failed to connect to Ollama at {ollama_url}: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc()
+            # Don't fail completely, just return active models from config
             
-        # 2. Format for Frontend
+        # 2. Get active models from config
+        active = get_active_models()
+        print(f"[DEBUG] Active models from config: {active}", file=sys.stderr, flush=True)
+            
+        # 3. Format for Frontend
         formatted_models = []
         for m in models_list_raw:
             model_name = m.get("name", "unknown")
             # Simple heuristic for type
-            is_embedding = "embed" in model_name or "nomic" in model_name or "bert" in model_name
+            is_embedding = "embed" in model_name.lower() or "nomic" in model_name.lower() or "bert" in model_name.lower() or "mxbai" in model_name.lower()
+            
+            model_type = "embedding" if is_embedding else "llm"
+            is_active = (model_type == "llm" and active.get("llm") in model_name) or \
+                       (model_type == "embedding" and active.get("embedding") in model_name)
             
             formatted_models.append({
                 "id": m.get("digest", model_name),
                 "name": model_name,
-                "type": "embedding" if is_embedding else "llm",
+                "type": model_type,
                 "size": m.get("size", 0),
-                "details": m.get("details", {})
+                "details": m.get("details", {}),
+                "isActive": is_active
             })
+        
+        print(f"[DEBUG] Returning {len(formatted_models)} formatted models", file=sys.stderr, flush=True)
             
         return {
             "models": formatted_models,
-            "active": active_models
+            "active": active
         }
             
     except Exception as e:
-        log.error(f"Error in get_models: {e}")
-        return {"models": [], "active": active_models}
+        print(f"[ERROR] Error in get_models: {e}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc()
+        active = get_active_models()
+        return {"models": [], "active": active}
 
 
 # ------------------------------------------------------------------------------

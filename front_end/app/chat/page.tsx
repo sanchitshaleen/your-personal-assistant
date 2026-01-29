@@ -1,11 +1,24 @@
-'use client';
+"use client";
+
+/*
+ High-level summary of recent updates:
+ - Moved conversation history into a docked right-side panel (open/close, transitions)
+ - Added controls to create, select, and delete conversations from the history panel
+ - Replaced top chat-tab UI with the right-side history panel and added a floating handle
+ - Fixed message send/streaming logic and integrated localStorage persistence for conversations
+ - Wire-up to open the history panel via the Sidebar 'Chats' button
+
+ These comments are intentionally brief; refer to `CHANGES.md` for a repo-level summary.
+*/
 
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { fileApi, chatApi } from '@/lib/api';
-import { FiSend, FiPlus, FiMenu, FiX, FiChevronDown, FiDatabase } from 'react-icons/fi';
+import { FiSend, FiPlus, FiMenu, FiX, FiChevronDown, FiDatabase, FiDownload } from 'react-icons/fi';
 import toast, { Toaster } from 'react-hot-toast';
 import Sidebar from '@/components/Sidebar';
+import ChatHistoryPanel from '@/components/ChatHistoryPanel';
 
 interface Message {
   id: string;
@@ -36,16 +49,32 @@ export default function ChatPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [isInitialized, setIsInitialized] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [showHistoryPanel, setShowHistoryPanel] = useState(false);
   const [showFileDropdown, setShowFileDropdown] = useState(false);
+  const [hasModels, setHasModels] = useState<boolean | null>(null); // null = loading, true/false = checked
   const messagesEndRef = useRef<HTMLDivElement>(null);
   
   // Use a fixed user_id for single-user mode
   const USER_ID = 'default_user';
   
   useEffect(() => {
-    fetchFiles();
-    loadConversations();
-    setIsInitialized(true);
+    const init = async () => {
+      await checkModels(); // Wait for model check first
+      fetchFiles();
+      loadConversations();
+      setIsInitialized(true);
+      // If navigation requested opening chat panel, clear flag and open panel
+      try {
+        const val = localStorage.getItem('chatPanelOpen');
+        if (val === 'true') {
+          setShowHistoryPanel(true);
+          localStorage.removeItem('chatPanelOpen');
+        }
+      } catch (err) {
+        // ignore
+      }
+    };
+    init();
   }, []);
   
   // Create initial conversation only after loading is complete and no conversations exist
@@ -69,6 +98,20 @@ export default function ChatPage() {
       );
     } catch (error) {
       toast.error('Failed to load files');
+    }
+  };
+
+  const checkModels = async () => {
+    try {
+      const response = await fetch('http://localhost:8002/models');
+      const data = await response.json();
+      // Check if we have any models installed or active models configured
+      const hasLLM = (data.models && data.models.some((m: any) => m.type === 'llm')) || 
+                     (data.active && data.active.llm);
+      setHasModels(hasLLM);
+    } catch (error) {
+      console.error('Failed to check models:', error);
+      setHasModels(false);
     }
   };
 
@@ -99,67 +142,50 @@ export default function ChatPage() {
   const saveConversations = (convs: Conversation[]) => {
     localStorage.setItem(`conversations_${USER_ID}`, JSON.stringify(convs));
   };
-
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!query.trim()) return;
-    
-    // Auto-create conversation if none exists
-    let activeConv = currentConversation;
-    if (!activeConv) {
-      activeConv = {
-        id: Date.now().toString(),
-        title: 'New Chat',
-        messages: [],
-        createdAt: new Date(),
-      };
-      setCurrentConversation(activeConv);
-      setConversations([activeConv, ...conversations]);
-    }
-
-    const userMessage: Message = {
-      id: Date.now().toString(),
-      role: 'user',
-      content: query,
-      files: Array.from(selectedFiles),
-      timestamp: new Date(),
-    };
-
+    if (!query.trim() || isLoading) return;
     setIsLoading(true);
-    try {
-      const updatedConv = {
-        ...activeConv,
-        messages: [...activeConv.messages, userMessage],
-      };
-      setCurrentConversation(updatedConv);
-      setQuery('');
 
-      // Update title if it's still "New Chat"
-      let finalConv = updatedConv;
-      if (updatedConv.title === 'New Chat' && query.length > 0) {
+    try {
+      // Ensure we have a conversation
+      let finalConv = currentConversation;
+      if (!finalConv) {
         finalConv = {
-          ...updatedConv,
-          title: query.substring(0, 50),
+          id: Date.now().toString(),
+          title: 'New Chat',
+          messages: [],
+          createdAt: new Date(),
         };
+        setConversations([finalConv, ...conversations]);
       }
 
-      // Use streaming RAG chat with selected files
+      // Append user message
+      const userMessage: Message = {
+        id: `${Date.now()}_u`,
+        role: 'user',
+        content: query,
+        files: Array.from(selectedFiles),
+        timestamp: new Date(),
+      };
+
+      finalConv = { ...finalConv, messages: [...finalConv.messages, userMessage] };
+      setCurrentConversation(finalConv);
+      setQuery('');
+
+      // Prepare assistant placeholder
       let assistantContent = '';
       const assistantMessage: Message = {
-        id: (Date.now() + 1).toString(),
+        id: `${Date.now()}_a`,
         role: 'assistant',
         content: '',
         timestamp: new Date(),
       };
 
-      // Add assistant message placeholder
-      finalConv = {
-        ...finalConv,
-        messages: [...finalConv.messages, assistantMessage],
-      };
+      finalConv = { ...finalConv, messages: [...finalConv.messages, assistantMessage] };
       setCurrentConversation(finalConv);
 
-      // Stream the response
+      // Stream the response from the backend
       const result = await chatApi.ragChat(
         query,
         USER_ID,
@@ -174,32 +200,15 @@ export default function ChatPage() {
         }
       );
 
-      // Add duration to the message
-      if (result.duration) {
-        assistantMessage.duration = result.duration;
-      }
-      
-      // Add chunks and timing info
-      if (result.chunks) {
-        assistantMessage.chunks = result.chunks;
-      }
-      if (result.retrievalTime) {
-        assistantMessage.retrievalTime = result.retrievalTime;
-      }
-      if (result.breakdown) {
-        assistantMessage.breakdown = result.breakdown;
-      }
+      if (result.duration) assistantMessage.duration = result.duration;
+      if (result.chunks) assistantMessage.chunks = result.chunks;
+      if (result.retrievalTime) assistantMessage.retrievalTime = result.retrievalTime;
+      if (result.breakdown) assistantMessage.breakdown = result.breakdown;
 
-      // Save final conversation
-      finalConv = {
-        ...finalConv,
-        messages: [...finalConv.messages.slice(0, -1), assistantMessage],
-      };
+      finalConv = { ...finalConv, messages: [...finalConv.messages.slice(0, -1), assistantMessage] };
       setCurrentConversation(finalConv);
 
-      const updatedConvs = conversations.map((c) =>
-        c.id === finalConv.id ? finalConv : c
-      );
+      const updatedConvs = conversations.map((c) => (c.id === finalConv!.id ? finalConv! : c));
       setConversations(updatedConvs);
       saveConversations(updatedConvs);
     } catch (error) {
@@ -210,7 +219,7 @@ export default function ChatPage() {
           ...currentConversation,
           messages: currentConversation.messages.slice(0, -1),
         };
-      setCurrentConversation(updatedConv);
+        setCurrentConversation(updatedConv);
       }
     } finally {
       setIsLoading(false);
@@ -230,6 +239,21 @@ export default function ChatPage() {
       newSelected.add(filename);
     }
     setSelectedFiles(newSelected);
+  };
+
+  const handleDeleteConversation = (id: string) => {
+    const remaining = conversations.filter((c) => c.id !== id);
+    setConversations(remaining);
+    saveConversations(remaining);
+
+    if (currentConversation && currentConversation.id === id) {
+      // Select next available conversation or clear
+      if (remaining.length > 0) {
+        setCurrentConversation(remaining[0]);
+      } else {
+        setCurrentConversation(null);
+      }
+    }
   };
 
   return (
@@ -258,21 +282,44 @@ export default function ChatPage() {
 
         {/* Messaging Area */}
         <div className="flex-1 overflow-y-auto px-4 py-6 scroll-smooth">
-           {!currentConversation || currentConversation.messages.length === 0 ? (
+           {hasModels === null ? (
+               /* Loading state - checking for models */
+               <div className="h-full flex items-center justify-center">
+                   <div className="text-center">
+                       <div className="w-12 h-12 border-4 border-green-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                       <p className="text-gray-500">Loading...</p>
+                   </div>
+               </div>
+           ) : !hasModels ? (
+               /* No Models Installed - Welcome Screen */
+               <div className="h-full flex flex-col items-center justify-center px-8 pb-20">
+                   <div className="max-w-lg text-center">
+                       <div className="w-20 h-20 rounded-full bg-gray-100 flex items-center justify-center mx-auto mb-6">
+                           <FiDownload className="w-10 h-10 text-gray-400" />
+                       </div>
+                       
+                       <h2 className="text-3xl font-bold text-gray-800 mb-3">No Model Installed</h2>
+                       <p className="text-gray-500 mb-8 leading-relaxed">
+                           Your Personal Assistant requires that you install at least one model to get started. 
+                           Choose from a variety of AI models optimized for different tasks.
+                       </p>
+                       
+                       <Link 
+                           href="/models"
+                           className="inline-flex items-center gap-2 px-6 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition shadow-md"
+                       >
+                           <FiDownload />
+                           Install a Model
+                       </Link>
+                       
+                       <p className="text-xs text-gray-400 mt-6">
+                           Models are downloaded from Ollama and run locally on your machine
+                       </p>
+                   </div>
+               </div>
+             ) : !currentConversation || currentConversation.messages.length === 0 ? (
                <div className="h-full flex flex-col items-center justify-center text-gray-300 pb-20">
-                   <h1 className="text-4xl font-bold text-gray-800 mb-8 tracking-tight">SiloQ</h1>
-                   
-                    <div className="grid grid-cols-2 gap-4 max-w-2xl w-full px-8">
-                        {['Explain the project structure', 'Summarize latest logs', 'How do I add a new model?', 'Debug connection issues'].map((starter) => (
-                             <button 
-                                key={starter}
-                                onClick={() => setQuery(starter)}
-                                className="p-4 bg-white border border-gray-200 rounded-xl text-left text-sm text-gray-600 hover:border-green-500 hover:shadow-sm transition"
-                             >
-                                {starter}
-                             </button>
-                        ))}
-                    </div>
+                 <h1 className="text-4xl font-bold text-gray-800 mb-8 tracking-tight">SiloQ</h1>
                </div>
            ) : (
                <div className="max-w-3xl mx-auto space-y-6">
@@ -286,9 +333,9 @@ export default function ChatPage() {
                            <div className={`max-w-[85%] rounded-2xl px-5 py-3 ${
                                msg.role === 'user' 
                                ? 'bg-gray-100 text-gray-900 rounded-tr-none' 
-                               : 'bg-white text-gray-800'
+                               : 'bg-white border border-gray-200 text-gray-900 shadow-sm'
                            }`}>
-                               <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+                               <p className="whitespace-pre-wrap leading-relaxed break-words">{msg.content || '...'}</p>
                                {msg.files && msg.files.length > 0 && (
                                    <div className="mt-2 pt-2 border-t border-gray-200/50 flex gap-2 flex-wrap">
                                         {msg.files.map(f => (
@@ -436,6 +483,32 @@ export default function ChatPage() {
             </div>
         </div>
       </main>
+
+      {/* Docked history panel as a flex sibling with width transition */}
+      <div className={`h-full transition-all duration-300 ease-in-out ${showHistoryPanel ? 'w-96' : 'w-0'} overflow-hidden`}> 
+        <div className="h-full flex flex-col">
+          {showHistoryPanel && (
+            <ChatHistoryPanel
+              conversations={conversations}
+              onSelect={(c) => { setCurrentConversation(c); setShowHistoryPanel(false); }}
+              onClose={() => setShowHistoryPanel(false)}
+              onNew={() => { createNewConversation(); setShowHistoryPanel(false); }}
+            />
+          )}
+        </div>
+      </div>
+
+      {/* Floating handle to re-open the history panel after user closes it */}
+      {!showHistoryPanel && (
+        <button
+          aria-label="Open conversation history"
+          title="Open conversation history"
+          onClick={() => setShowHistoryPanel(true)}
+          className="fixed right-0 top-1/2 -translate-y-1/2 mr-2 z-40 bg-white border border-gray-200 rounded-l-full px-3 py-2 shadow hover:bg-gray-50 focus:outline-none"
+        >
+          Chats
+        </button>
+      )}
     </div>
   );
 }

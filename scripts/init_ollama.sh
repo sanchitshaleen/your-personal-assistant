@@ -1,4 +1,8 @@
+
 #!/bin/bash
+
+# Ensure OLLAMA_HOST is exported for Python subprocess
+export OLLAMA_HOST=${OLLAMA_HOST:-"http://host.docker.internal:11434"}
 
 # Pre-pull Ollama models before starting FastAPI
 echo "Initializing Ollama models..."
@@ -13,7 +17,8 @@ import urllib.request
 import json
 import sys
 
-ollama_host = "http://ollama:11434"
+import os
+ollama_host = os.environ.get("OLLAMA_HOST", "http://ollama:11434")
 max_attempts = 60  # 2 minutes total
 attempt = 0
 

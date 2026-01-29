@@ -21,7 +21,7 @@ LLM_CHAT_MODEL_NAME: str = "gemma3:1b"                # Chatting model (1B - bal
 LLM_CHAT_TEMPERATURE: float = 0.75
 LLM_SUMMARY_MODEL_NAME: str = "gemma3:1b"             # History Summarization model
 LLM_SUMMARY_TEMPERATURE: float = 0.5
-EMB_MODEL_NAME: str = "nomic-embed-text"           # Embeddings model (using latest tag)
+EMB_MODEL_NAME: str = "nomic-embed-text:latest"           # Embeddings model (using latest tag)
 
 
 # Verification configuration:

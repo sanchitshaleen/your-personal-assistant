@@ -29,21 +29,13 @@ export default function HomePage() {
             {/* Can add user profile or other header items here if needed */}
         </header>
 
-        {/* Main Content Area - Centered Welcome */}
+        {/* Main Content Area - App Description */}
         <div className="flex-1 flex flex-col items-center justify-center p-8 pb-32">
-             <h1 className="text-5xl font-bold text-gray-900 mb-16 tracking-tight">SiloQ</h1>
-             
-             <div className="grid grid-cols-1 md:grid-cols-2 gap-6 max-w-3xl w-full px-4">
-                  {['Explain the project structure', 'Summarize latest logs', 'How do I add a new model?', 'Debug connection issues'].map((starter) => (
-                       <button 
-                          key={starter}
-                          onClick={() => handleStarterClick(starter)}
-                          className="p-6 bg-white border border-gray-200 rounded-2xl text-left text-gray-600 hover:border-green-500 hover:ring-1 hover:ring-green-500 hover:shadow-md transition duration-200 group"
-                       >
-                          <span className="group-hover:text-green-700 transition-colors">{starter}</span>
-                       </button>
-                  ))}
-             </div>
+          <h1 className="text-5xl font-bold text-gray-900 mb-8 tracking-tight">SiloQ</h1>
+          <p className="max-w-2xl text-lg text-gray-700 mb-12 text-center">
+            <b>SiloQ</b> is your personal AI-powered assistant for chat, document Q&A, and model management. Start a new chat, explore available models, or upload your own documents for retrieval-augmented generation. SiloQ is designed to help you interact with your data and AI models in a seamless, user-friendly way.
+          </p>
+          {/* Sample questions removed as requested */}
         </div>
       </main>
     </div>
