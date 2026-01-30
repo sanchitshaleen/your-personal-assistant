@@ -28,7 +28,7 @@ Your AI-powered local RAG assistant for chatting with your documents
 
 ### Chats
 <p align="center">
-  <img src="docs/screenshots/screenshot-3.png" alt="Chat UI" style="max-width:900px; width:100%; height:auto;" />
+  <img src="docs/screenshots/screenshot-3-updated.png" alt="Chat UI" style="max-width:900px; width:100%; height:auto;" />
 </p>
 
 ### Models
