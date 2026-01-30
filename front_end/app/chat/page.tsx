@@ -19,6 +19,48 @@ import { FiSend, FiPlus, FiMenu, FiX, FiChevronDown, FiDatabase, FiDownload } fr
 import toast, { Toaster } from 'react-hot-toast';
 import Sidebar from '@/components/Sidebar';
 import ChatHistoryPanel from '@/components/ChatHistoryPanel';
+// Lightweight, safe Markdown renderer for bold, italics, lists, and line breaks.
+const escapeHtml = (unsafe: string) =>
+  unsafe
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+
+const renderSimpleMarkdown = (text: string) => {
+  if (!text) return '';
+  // Escape HTML first
+  let out = escapeHtml(text);
+
+  // Bold **text**
+  out = out.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  // Italic *text* (avoid interfering with bold)
+  out = out.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>');
+  // Simple unordered lists: lines starting with - or *
+  const lines = out.split(/\r?\n/);
+  let inList = false;
+  const processed: string[] = [];
+  for (let line of lines) {
+    if (/^\s*[-*]\s+/.test(line)) {
+      if (!inList) {
+        processed.push('<ul>');
+        inList = true;
+      }
+      processed.push('<li>' + line.replace(/^\s*[-*]\s+/, '') + '</li>');
+    } else {
+      if (inList) {
+        processed.push('</ul>');
+        inList = false;
+      }
+      // Preserve paragraphs / line breaks
+      if (line.trim() === '') processed.push('<br/>');
+      else processed.push('<p>' + line + '</p>');
+    }
+  }
+  if (inList) processed.push('</ul>');
+  return processed.join('\n');
+};
 
 interface Message {
   id: string;
@@ -48,6 +90,7 @@ export default function ChatPage() {
   const [query, setQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isInitialized, setIsInitialized] = useState(false);
+  const didAutoCreateRef = useRef(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showHistoryPanel, setShowHistoryPanel] = useState(false);
   const [showFileDropdown, setShowFileDropdown] = useState(false);
@@ -79,8 +122,12 @@ export default function ChatPage() {
   
   // Create initial conversation only after loading is complete and no conversations exist
   useEffect(() => {
-    if (isInitialized && conversations.length === 0 && !currentConversation) {
+    // Auto-create an initial conversation only once after initialization.
+    // This avoids immediately recreating a "New Chat" after the user deletes
+    // the last conversation (user expects it to be removed).
+    if (isInitialized && conversations.length === 0 && !currentConversation && !didAutoCreateRef.current) {
       createNewConversation();
+      didAutoCreateRef.current = true;
     }
   }, [isInitialized, conversations.length, currentConversation]);
 
@@ -242,11 +289,15 @@ export default function ChatPage() {
   };
 
   const handleDeleteConversation = (id: string) => {
-    const remaining = conversations.filter((c) => c.id !== id);
+    // Normalize IDs to string to avoid mismatches between numeric and string ids
+    const remaining = conversations.filter((c) => String(c.id) !== String(id));
     setConversations(remaining);
     saveConversations(remaining);
 
-    if (currentConversation && currentConversation.id === id) {
+    // Notify user
+    toast.success('Conversation deleted');
+
+    if (currentConversation && String(currentConversation.id) === String(id)) {
       // Select next available conversation or clear
       if (remaining.length > 0) {
         setCurrentConversation(remaining[0]);
@@ -323,7 +374,7 @@ export default function ChatPage() {
                </div>
            ) : (
                <div className="max-w-3xl mx-auto space-y-6">
-                   {currentConversation.messages.map((msg) => (
+                     {currentConversation.messages.map((msg) => (
                        <div key={msg.id} className={`flex gap-4 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                            {msg.role === 'assistant' && (
                                <div className="w-8 h-8 rounded-full bg-green-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0 mt-1">
@@ -335,7 +386,11 @@ export default function ChatPage() {
                                ? 'bg-gray-100 text-gray-900 rounded-tr-none' 
                                : 'bg-white border border-gray-200 text-gray-900 shadow-sm'
                            }`}>
+                             {msg.role === 'assistant' ? (
+                               <div className="prose prose-sm max-w-full" dangerouslySetInnerHTML={{ __html: renderSimpleMarkdown(msg.content || '...') }} />
+                             ) : (
                                <p className="whitespace-pre-wrap leading-relaxed break-words">{msg.content || '...'}</p>
+                             )}
                                {msg.files && msg.files.length > 0 && (
                                    <div className="mt-2 pt-2 border-t border-gray-200/50 flex gap-2 flex-wrap">
                                         {msg.files.map(f => (
@@ -493,6 +548,7 @@ export default function ChatPage() {
               onSelect={(c) => { setCurrentConversation(c); setShowHistoryPanel(false); }}
               onClose={() => setShowHistoryPanel(false)}
               onNew={() => { createNewConversation(); setShowHistoryPanel(false); }}
+              onDelete={(id) => handleDeleteConversation(id)}
             />
           )}
         </div>

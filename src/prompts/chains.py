@@ -117,11 +117,15 @@ def build_rag_chain(
                 except Exception as e:
                     log.error(f"format_docs_for_chain: Error processing doc {i}: {e}")
             
-            # Build context string from formatted documents
-            context_str = "\n\n".join([
-                f"Doc {i+1}: {doc.page_content[:500] if hasattr(doc, 'page_content') else str(doc)[:500]}" 
-                for i, doc in enumerate(formatted_docs[:3])
-            ])
+            # Build context string from formatted documents, include filename/source explicitly
+            context_entries = []
+            for i, doc in enumerate(formatted_docs[:3]):
+                src = getattr(doc, 'metadata', {}) or {}
+                filename = src.get('filename') or src.get('source') or f'unknown_{i+1}'
+                content_preview = doc.page_content[:500] if hasattr(doc, 'page_content') else str(doc)[:500]
+                entry = f"Source: {filename}\nContent: {content_preview}"
+                context_entries.append(entry)
+            context_str = "\n\n".join(context_entries)
             
             log.info(f"format_docs_for_chain: Formatted {len(formatted_docs)} docs from {len(sources)} sources")
             

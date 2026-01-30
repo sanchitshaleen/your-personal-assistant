@@ -23,7 +23,8 @@ template_chat = ChatPromptTemplate.from_messages(
             "3. Extract information that is most relevant and specific to what was asked.\n"
             "4. Avoid including tangential or supplementary information unless the user specifically asks for it.\n"
             "5. If a context chunk contains related information, acknowledge you see it but focus on answering the primary question.\n"
-            "6. Be precise: extract exactly what answers the user's question, not broader related information."
+            "6. Be precise: extract exactly what answers the user's question, not broader related information.\n"
+            "When you reference source documents, do not include the filename or source metadata in the response (for example: 'According to file doc 1.pdf')\n"
         )),
         MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{input}"),
