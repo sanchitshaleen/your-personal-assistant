@@ -23,24 +23,22 @@ Your AI-powered local RAG assistant for chatting with your documents
 
 ---
 
+
 ## 🎬 Demo
 
-- `docs/screenshots/screenshot-1.png` — Local Documents / Dashboard view
-- `docs/screenshots/screenshot-2.png` — Models page (installed models)
-- `docs/screenshots/screenshot-3.png` — Chat UI (chat screen)
-
-
-<!-- Example image rendering (replace the PNGs with your actual screenshots) -->
+### Chats
 <p align="center">
-  <img src="docs/screenshots/screenshot-1.png" alt="Local Documents" style="max-width:900px; width:100%; height:auto;" />
+  <img src="docs/screenshots/screenshot-3.png" alt="Chat UI" style="max-width:900px; width:100%; height:auto;" />
 </p>
 
+### Models
 <p align="center">
   <img src="docs/screenshots/screenshot-2.png" alt="Models" style="max-width:900px; width:100%; height:auto;" />
 </p>
 
+### Local Documents
 <p align="center">
-  <img src="docs/screenshots/screenshot-3.png" alt="Chat UI" style="max-width:900px; width:100%; height:auto;" />
+  <img src="docs/screenshots/screenshot-1.png" alt="Local Documents" style="max-width:900px; width:100%; height:auto;" />
 </p>
 
 
