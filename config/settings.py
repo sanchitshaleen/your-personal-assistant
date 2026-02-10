@@ -22,6 +22,7 @@ LLM_CHAT_TEMPERATURE: float = 0.75
 LLM_SUMMARY_MODEL_NAME: str = "gemma3:1b"             # History Summarization model
 LLM_SUMMARY_TEMPERATURE: float = 0.5
 EMB_MODEL_NAME: str = "nomic-embed-text:latest"           # Embeddings model (using latest tag)
+GRAPH_LLM_MODEL_NAME: str = "gemma3:2b"                   # Model for Graph Extraction
 
 
 # Verification configuration:
@@ -91,6 +92,16 @@ MAX_CONTENT_SAFETY_MARGIN: float = float(os.getenv("MAX_CONTENT_SAFETY_MARGIN", 
 QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_COLLECTION_NAME: str = "documents"
+
+
+# ============================================================================
+# NEO4J GRAPH DATABASE
+# ============================================================================
+
+NEO4J_URI: str = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
+NEO4J_USERNAME: str = os.getenv("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", "password")
+GRAPH_INGESTION_ENABLED: bool = os.getenv("GRAPH_INGESTION_ENABLED", "true").lower() == "true"
 
 
 # ============================================================================

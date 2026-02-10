@@ -406,7 +406,7 @@ def get_uploads(user_id: str) -> dict:
         with get_connection() as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT filename, created_at, available, embedding_status, embedding_model, file_size, chunk_count
+                SELECT filename, created_at, available, embedding_status, embedding_model, file_size, chunk_count, error_message, ingestion_target
                 FROM uploads
                 WHERE user_id = %s AND available = 1
                 ORDER BY created_at DESC
@@ -422,7 +422,9 @@ def get_uploads(user_id: str) -> dict:
                     'embedding_status': row[3],
                     'embedding_model': row[4],
                     'size': row[5],
-                    'chunk_count': row[6]
+                    'chunk_count': row[6],
+                    'error_message': row[7] if len(row) > 7 else None,
+                    'ingestion_target': row[8] if len(row) > 8 else 'qdrant'
                 })
             
             return {'files': files_list}
@@ -430,6 +432,30 @@ def get_uploads(user_id: str) -> dict:
     except psycopg2.Error as e:
         log.error(f"PostgreSQL error while retrieving uploads for user '{user_id}': {e}")
         return {'files': []}
+
+
+def get_ingestion_target(file_id: int) -> str:
+    """Get the ingestion target for a specific file.
+    
+    Args:
+        file_id (int): The file ID.
+    
+    Returns:
+        str: 'qdrant', 'neo4j', or 'both'
+    """
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT ingestion_target 
+                FROM uploads 
+                WHERE file_id = %s
+            """, (file_id,))
+            result = cur.fetchone()
+            return result[0] if result else 'qdrant'  # Default to qdrant
+    except psycopg2.Error as e:
+        log.error(f"Error fetching ingestion target for file {file_id}: {e}")
+        return 'qdrant'  # Safe default
 
 
 def mark_file_removed(user_id: str, file_id: int) -> bool:
@@ -628,6 +654,57 @@ def get_embedding_status(file_id: int) -> str:
     except psycopg2.Error as e:
         log.error(f"PostgreSQL error while getting embedding status for file {file_id}: {e}")
         return 'pending'
+
+
+def update_file_success(file_id: int, doc_ids: List[str], summary: str = None):
+    """Updates the database after successful file ingestion.
+    - Sets status to 'completed'
+    - Updates chunk count
+    - Sets available = 1
+    - Updates summary
+    - Adds vector IDs to embeddings table
+    """
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cst_time = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+            
+            # 1. Update uploads table
+            query = """
+                UPDATE uploads 
+                SET embedding_status = 'completed', 
+                    updated_at = %s, 
+                    chunk_count = %s, 
+                    available = 1
+            """
+            params = [cst_time, len(doc_ids)]
+            
+            if summary:
+                query += ", summary = %s"
+                params.append(summary)
+            
+            query += " WHERE file_id = %s"
+            params.append(file_id)
+            
+            cur.execute(query, tuple(params))
+            
+            # 2. Add embeddings
+            if doc_ids:
+                # First delete existing embeddings for this file (idempotency)
+                cur.execute("DELETE FROM embeddings WHERE file_id = %s", (file_id,))
+                
+                # Bulk insert new IDs
+                if len(doc_ids) > 0:
+                    args_str = ','.join(cur.mogrify("(%s, %s)", (file_id, did)).decode('utf-8') for did in doc_ids)
+                    cur.execute("INSERT INTO embeddings (file_id, vector_id) VALUES " + args_str)
+            
+            conn.commit()
+            log.info(f"Successfully updated DB for file {file_id}: status=completed, chunks={len(doc_ids)}, summary={'yes' if summary else 'no'}")
+            return True
+
+    except psycopg2.Error as e:
+        log.error(f"Failed to update file success status: {e}")
+        return False
 
 
 def set_embedding_status(file_id: int, status: str) -> bool:

@@ -193,12 +193,15 @@ class HistoryStore:
         Returns:
             RedisChatHistory: The persistent chat message history for the session.
         """
+        log.info(f"[DEBUG HISTORY] get_session_history called for session_id: '{session_id}'")
+        
         if session_id not in self.histories:
             self.histories[session_id] = RedisChatHistory(session_id)
-            log.info(f"Created/loaded history for session: `{session_id}`")
+            log.info(f"Created/loaded history for session: `{session_id}` with {len(self.histories[session_id].messages)} messages")
         else:
-            log.info(f"Retrieved cached history for session: `{session_id}`")
+            log.info(f"Retrieved cached history for session: `{session_id}` with {len(self.histories[session_id].messages)} messages")
 
+        log.info(f"[DEBUG HISTORY] Returning history with {len(self.histories[session_id].messages)} messages")
         return self.histories[session_id]
 
     def clear_session_history(self, session_id: str) -> bool:

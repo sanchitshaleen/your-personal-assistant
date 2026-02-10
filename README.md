@@ -20,6 +20,8 @@ Your AI-powered local RAG assistant for chatting with your documents
 - 🔒 **Privacy-First** — Everything runs locally, no cloud services or API keys needed
 - ⚡ **Real-Time Streaming** — Get responses as they're generated
 - 🎯 **Background Processing** — Celery workers handle document indexing efficiently
+- 🕸️ **Knowledge Graph RAG** — Extracts entities and relationships for deep context retrieval
+- 🗺️ **Agentic Reasoning** — Smart planner decides when to use Vector vs Graph search
 
 ---
 
@@ -46,53 +48,159 @@ Your AI-powered local RAG assistant for chatting with your documents
 
 ## 🏗️ Architecture
 
+```mermaid
+graph TD
+    %% --- Styles ---
+    classDef container fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef component fill:#fff,stroke:#333,stroke-width:1px;
+    classDef db fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+    classDef user fill:#ffe0b2,stroke:#f57c00,stroke-width:2px;
+    classDef external fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef legend fill:#f0f0f0,stroke:#9e9e9e,stroke-width:1px,stroke-dasharray: 5 5;
+
+    %% --- Legend ---
+    subgraph Legend ["ℹ️ Legend"]
+        direction LR
+        L1[I-xx : Ingestion Flow]:::legend
+        L2[R-xx : Retrieval Flow]:::legend
+    end
+
+    %% --- External / User ---
+    User((👤 User)):::user
+
+    %% --- Frontend Container ---
+    subgraph C_Frontend [🐳 Container: chat-frontend]
+        NextJS[Next.js App]:::component
+    end
+
+    %% --- Backend Container ---
+    subgraph C_Backend [🐳 Container: chat-fastapi]
+        API_Endpoint[API Endpoints]:::component
+        
+        subgraph Orchestrator [Agentic Orchestrator]
+            Planner[R-2. Strategy Planner]:::component
+            Router{R-3. Router}:::component
+            Generator[R-6. Generator]:::component
+        end
+        
+        Retrievers[R-4. Retrievers<br/>Hybrid & Graph]:::component
+    end
+
+    %% --- Worker Container ---
+    subgraph C_Worker [🐳 Container: chat-celery-worker]
+        Worker[Async Worker]:::component
+        Loader[I-5. Document Loader]:::component
+        Splitter[I-6. Text Splitter]:::component
+        Embedder[I-7. Embedding/Graph Extraction]:::component
+    end
+
+    %% --- Data Layer (Separate Containers) ---
+    subgraph Data_Layer [Data Persistence Infrastructure]
+        direction LR
+        Postgres[(🐘 PostgreSQL<br/>Metadata)]:::db
+        Redis[(⚡ Redis<br/>Cache & Bus)]:::db
+        Qdrant[(🛡️ Qdrant<br/>Vector DB)]:::db
+        Neo4j[(🕸️ Neo4j<br/>Graph DB)]:::db
+    end
+
+    %% --- LLM Service (Ollama) ---
+    subgraph C_Ollama [🐳 Container: chat-ollama]
+        Ollama[🦙 Ollama Inference]:::external
+    end
+
+    %% ==================================================
+    %% FLOW I: Data Ingestion (Async) - Prefix "I-"
+    %% ==================================================
+    User -- "I-1. Upload File" --> NextJS
+    NextJS -- "I-2. POST /ingest" --> API_Endpoint
+    API_Endpoint -.->|"I-3. Enqueue Task"| Redis
+    Redis -.->|"I-4. Consume Task"| Worker
+    
+    Worker --> Loader
+    Loader --> Splitter
+    Splitter --> Embedder
+    
+    Embedder -- "I-8. Store Vectors" --> Qdrant
+    Embedder -- "I-8. Store Graph" --> Neo4j
+    
+    %% Metadata Updates
+    Worker -- "I-9. Update Status" --> Postgres
+
+    %% ==================================================
+    %% FLOW R: Retrieval & Inference (RAG) - Prefix "R-"
+    %% ==================================================
+    User -- "R-1. Question" --> NextJS
+    NextJS -- "R-1. API Request" --> API_Endpoint
+    API_Endpoint --> Planner
+    
+    %% Planning uses Metadata & Summaries
+    Planner <-->|"Get File Metadata"| Postgres
+    Planner <-->|"Get Doc Summaries"| Qdrant
+    
+    Planner --> Router
+    Router -- "Hybrid" --> Retrievers
+    Router -- "Graph" --> Retrievers
+    
+    Retrievers <-->|"R-5. Search"| Qdrant
+    Retrievers <-->|"R-5. Search"| Neo4j
+    
+    Retrievers --> Generator
+    Generator <-->|"Inference"| Ollama
+    
+    Generator -- "R-7. Final Answer" --> API_Endpoint
+    API_Endpoint --> NextJS
+    NextJS --> User
+
+    %% Styles
+    class C_Frontend,C_Backend,C_Worker,C_Ollama container;
+    class Postgres,Redis,Qdrant,Neo4j db;
 ```
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│   Next.js UI     │────▶│  FastAPI Backend │────▶│  Ollama (Local)  │
-│  (port 3000)     │     │   (port 8002)    │     │  Gemma 3 + Embed │
-└──────────────────┘     └────────┬─────────┘     └──────────────────┘
-                                  │
-                     ┌────────────┼────────────┐
-                     ▼            ▼            ▼
-               ┌──────────┐ ┌──────────┐ ┌──────────┐
-               │  Qdrant  │ │PostgreSQL│ │  Redis   │
-               │ (Vectors)│ │(Metadata)│ │(History) │
-               └──────────┘ └──────────┘ └──────────┘
-                     ▲
-                     │
-               ┌──────────┐
-               │  Celery  │
-               │ (Workers)│
-               └──────────┘
-```
+
+### Architecture Highlights
+
+#### 🐳 Docker Infrastructure
+The system is composed of localized services running in Docker containers:
+1.  **Frontend**: Next.js application serving the UI.
+2.  **FastAPI Backend**: Handles API requests and orchestrates the RAG agent.
+3.  **Celery Worker**: Dedicated container for heavy background processing (document loading, embedding).
+4.  **Data Stores**: Dedicated containers for PostgreSQL, Redis, Qdrant, and Neo4j.
+
+#### 🐘 PostgreSQL Metadata
+PostgreSQL acts as the **central metadata registry**:
+-   **File Tracking**: Stores filenames, upload dates, and processing status.
+-   **Ingestion Control**: Tracks which files are processed and where (Qdrant vs Neo4j).
+-   **Agent Lookup**: The **Planner** queries Postgres to know which files are available and compatible with the user's query.
+
+#### 🔢 Sequential Flows
+
+**Data Ingestion (Prefix I-)**:
+1.  **I-1 to I-2**: User uploads file via Frontend to Backend.
+2.  **I-3 to I-4**: Backend enqueues task in Redis; Worker consumes it.
+3.  **I-5 to I-7**: Worker loads, splits, and embeds the document.
+4.  **I-8**: Vectors are stored in Qdrant, Graph data in Neo4j.
+5.  **I-9**: Worker updates the file status in PostgreSQL.
+
+**RAG Retrieval (Prefix R-)**:
+1.  **R-1**: User asks a question.
+2.  **R-2**: **Planner** checks PostgreSQL for file metadata and Qdrant for summaries to decide strategy.
+3.  **R-3**: **Router** directs to Hybrid or Graph retrieval.
+4.  **R-4 to R-5**: **Retrievers** fetch relevant context from Qdrant/Neo4j.
+5.  **R-6**: **Generator** uses Ollama to synthesize the answer.
+6.  **R-7**: Final answer is returned to the user.
 
 ### Tech Stack
 
 | Component | Technology |
 |-----------|-----------|
 | Frontend | Next.js 14, TypeScript, Tailwind CSS |
-| Backend | FastAPI, Python 3.11+, LangChain |
+| Backend | FastAPI, Python 3.11+, LangChain, LangGraph |
 | AI/ML | Ollama (Gemma 3 1B), nomic-embed-text |
 | Vector DB | Qdrant |
+| Graph DB | Neo4j |
 | Databases | PostgreSQL, Redis |
 | Task Queue | Celery |
 | Infrastructure | Docker, Docker Compose |
 
----
-
-## ⚠️ Common Issues & Quick Fixes
-
-| Issue | Quick Fix |
-|-------|-----------|
-| 🔴 Models not showing in UI | `ollama list` → verify models installed → `docker-compose restart fastapi` |
-| 🔴 Files stuck "Embedding in progress" | `docker-compose up -d celery-worker` → check `docker logs chat-celery-worker` |
-| 🔴 "Connection refused" to Ollama | Ollama must run on **host**, not Docker → `ollama serve` → use `host.docker.internal:11434` |
-| 🔴 Chat shows "No Model Installed" | Install models via UI at http://localhost:3000/models |
-| 🔴 Port 3000 already in use | `lsof -ti:3000 \| xargs kill -9` or change port in docker-compose.yml |
-| 🔴 Out of memory | Use `gemma3:270m` (292MB) instead of larger models |
-| 🔴 Frontend not updating | Run locally: `cd front_end && npm install && npm run dev` |
-
-Full troubleshooting guide in [🔧 Troubleshooting](#-troubleshooting) section below.
 
 ---
 
@@ -150,6 +258,7 @@ docker-compose ps
 - ✅ postgres (healthy)
 - ✅ redis (healthy)
 - ✅ qdrant (healthy)
+- ✅ neo4j (healthy)
 - ✅ fastapi (running)
 - ✅ celery-worker (running)
 - ✅ frontend (healthy)
@@ -160,6 +269,7 @@ Open your browser to:
 - 🎨 **Frontend:** http://localhost:3000
 - 🔧 **API Docs:** http://localhost:8002/docs
 - 📊 **Redis UI:** http://localhost:8083
+- 🕸️ **Neo4j Browser:** http://localhost:7474
 - 🌺 **Celery Monitor:** http://localhost:5555
 
 ### 5. Install AI Models via UI
@@ -199,6 +309,10 @@ docker logs chat-celery-worker 2>&1 | grep -q "ready" && echo "✅ Celery ready"
 # 4. Check database connections
 curl http://localhost:8002/ | jq
 # Should return: {"status":"healthy"}
+
+# 5. Check Neo4j is ready
+docker exec chat-neo4j cypher-shell -u neo4j -p password "RETURN 1;"
+# Should return: 1
 ```
 
 ---
@@ -239,6 +353,12 @@ services:
       # Must match fastapi broker settings
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
+
+      # Neo4j (Graph RAG)
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USERNAME=neo4j
+      - NEO4J_PASSWORD=password
+      - GRAPH_INGESTION_ENABLED=true
 ```
 
 **⚠️ Important:** If `CELERY_BROKER_URL` is missing, file embeddings will fail with "Redis connection refused"!
@@ -264,6 +384,10 @@ REDIS_HOST = "redis"
 
 # Ollama connection
 OLLAMA_BASE_URL = "http://host.docker.internal:11434"
+
+# Neo4j Graph
+NEO4J_URI = "bolt://neo4j:7687"
+GRAPH_INGESTION_ENABLED = True
 ```
 
 ### Switching Models
@@ -506,7 +630,7 @@ docker-compose ps
 docker network ls | grep chat_network
 
 # 3. Restart databases
-docker-compose restart postgres redis qdrant
+docker-compose restart postgres redis qdrant neo4j
 
 # 4. Check logs
 docker-compose logs postgres
@@ -591,7 +715,7 @@ docker-compose logs -f fastapi celery-worker
 
 **Backend:**
 - FastAPI - API server
-- LangChain - RAG orchestration
+- LangChain / LangGraph - Agentic RAG orchestration
 - Celery - Background tasks
 - Python 3.11+
 
@@ -602,6 +726,7 @@ docker-compose logs -f fastapi celery-worker
 
 **Databases:**
 - Qdrant - Vector storage
+- Neo4j - Knowledge Graph storage
 - PostgreSQL - File metadata
 - Redis - Chat history & task queue
 
@@ -652,7 +777,7 @@ flake8 src/
 - [ ] **Cloud Drive Integration** — Connect to Google Drive, Dropbox, OneDrive for seamless document sync
 - [ ] **Async Folder Monitoring** — Automatic detection of changes in source folders with triggered re-indexing
 - [ ] **Multi-Modal Support** — Process images, audio, and video with vision and speech models
-- [ ] **Knowledge Graphs support** — Knowledge graph visualization of document relationships
+- [x] **Knowledge Graphs support** — Knowledge graph visualization of document relationships
 
 
 ---

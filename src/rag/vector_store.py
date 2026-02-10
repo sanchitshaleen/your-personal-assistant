@@ -18,7 +18,8 @@ from langchain_core.vectorstores import VectorStore
 from langchain_core.vectorstores import VectorStoreRetriever
 
 from src.core.logger import get_logger
-from src.rag.retrieval import BM25SemanticHybridRetriever
+from src.rag.retrieval import BM25SemanticHybridRetriever, Neo4jVectorRetriever
+from config import settings
 
 log = get_logger(name="core_database")
 
@@ -184,12 +185,13 @@ class VectorDB:
         bm25_weight: float = 0.5, 
         semantic_weight: float = 0.5
     ) -> BM25SemanticHybridRetriever:
-        """Get a deterministic hybrid retriever combining BM25 and Semantic search.
+        """Get a deterministic hybrid retriever combining BM25, Semantic, and Graph search.
         
         This hybrid approach is simpler and more deterministic than SPLADE:
         - BM25: Sparse lexical matching (deterministic, no floating-point variations)
         - Semantic: Dense vector search (deterministic cosine similarity)
-        - Fusion: Weighted combination (fully deterministic)
+        - Graph: Vector search on Neo4j Graph (if enabled)
+        - Fusion: Weighted combination via RRF (fully deterministic)
         
         Args:
             bm25_weight: Weight for BM25 lexical scores (default 0.5)
@@ -197,18 +199,13 @@ class VectorDB:
         
         Returns:
             BM25SemanticHybridRetriever instance
-            
-        Benefits:
-            - DETERMINISTIC: Same query always returns same chunk order
-            - HYBRID: Combines lexical and semantic understanding
-            - SIMPLE: No external APIs or complex fusion methods
-            - RELIABLE: Weighted average of two stable scoring methods
         """
-        log.info(f"Creating BM25+Semantic hybrid retriever: BM25_weight={bm25_weight}, Semantic_weight={semantic_weight}")
+
+        log.info(f"Creating Hybrid retriever: BM25+Semantic")
         
         # Get Qdrant client from the vector store
         qdrant_client = self.db.client
-        
+
         # Create BM25 + Semantic hybrid retriever
         hybrid = BM25SemanticHybridRetriever(
             qdrant_client=qdrant_client,
@@ -220,6 +217,32 @@ class VectorDB:
         )
         
         return hybrid
+
+    def get_neo4j_retriever(self, k: int = 5):
+        """Returns the Neo4j Graph Vector Retriever."""
+        if not settings.GRAPH_INGESTION_ENABLED:
+            log.warning("Graph ingestion is disabled. Cannot create Neo4j retriever.")
+            return None
+            
+        try:
+            # Import here to avoid hard dependency
+            from langchain_community.graphs import Neo4jGraph
+            
+            log.info("Initializing Neo4j connection for retrieval...")
+            neo4j_graph = Neo4jGraph(
+                url=settings.NEO4J_URI,
+                username=settings.NEO4J_USERNAME,
+                password=settings.NEO4J_PASSWORD
+            )
+            
+            return Neo4jVectorRetriever(
+                neo4j_graph=neo4j_graph,
+                embeddings=self.embeddings,
+                k=k
+            )
+        except Exception as e:
+            log.error(f"Failed to create Neo4j retriever: {e}")
+            return None
 
     def delete_documents(self, document_ids: list) -> int:
         """Delete documents from Qdrant by their IDs.

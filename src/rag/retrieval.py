@@ -33,7 +33,7 @@ class BM25SemanticHybridRetriever:
         k: int = 5
     ):
         """
-        Initialize BM25 + Semantic hybrid retriever with RRF (Reciprocal Rank Fusion).
+        Initialize BM25 + Semantic hybrid retriever with RRF.
         
         Args:
             qdrant_client: Qdrant client instance
@@ -47,9 +47,6 @@ class BM25SemanticHybridRetriever:
         self.collection_name = collection_name
         self.embeddings = embeddings
         self.k = k
-        
-        # Note: bm25_weight and semantic_weight are no longer used with RRF scoring
-        # RRF treats both ranking sources equally and combines them by rank position
         
         # Initialize BM25 index
         self._initialize_bm25_index()
@@ -65,6 +62,11 @@ class BM25SemanticHybridRetriever:
             all_docs = self._fetch_all_documents()
             log.info(f"Fetched {len(all_docs)} documents for BM25 indexing")
             
+            if not all_docs:
+                log.warning("No documents found for BM25 index.")
+                self.bm25_retriever = None
+                return
+
             # Create BM25 retriever
             self.bm25_retriever = BM25Retriever.from_documents(
                 documents=all_docs,
@@ -120,16 +122,6 @@ class BM25SemanticHybridRetriever:
     def retrieve_hybrid(self, query: str, selected_files: List[str] = None) -> List[Document]:
         """
         Perform hybrid retrieval using RRF (Reciprocal Rank Fusion).
-        
-        RRF combines rankings from BM25 and Semantic retrievers using:
-        RRF(d) = sum(1 / (k + rank)) for each ranker
-        
-        Args:
-            query: User query string
-            selected_files: Optional list of filenames to filter results. If provided, only docs from these files are returned.
-        
-        Returns:
-            List of top-k documents sorted by RRF score
         """
         log.info(f"Starting RRF hybrid retrieval for: '{query[:80]}'")
         if selected_files:
@@ -138,7 +130,7 @@ class BM25SemanticHybridRetriever:
         # Step 1: BM25 retrieval
         bm25_docs = self._retrieve_bm25(query)
         
-        # Step 2: Semantic retrieval
+        # Step 2: Semantic retrieval (Qdrant)
         semantic_docs = self._retrieve_semantic(query)
         
         # Step 3: Combine using RRF
@@ -161,7 +153,7 @@ class BM25SemanticHybridRetriever:
             rrf_score = info['rrf_score']
             filename = doc.metadata.get('filename', 'unknown')
             content = doc.page_content[:80]
-            log.info(f"  {i}. [RRF={rrf_score:.4f}, BM25_rank={bm25_rank}, Semantic_rank={semantic_rank}, File={filename}] {content}...")
+            log.info(f"  {i}. [RRF={rrf_score:.4f}, BM25={bm25_rank}, Sem={semantic_rank}, File={filename}] {content}...")
         
         # Extract actual Document objects from the sorted results
         final_docs = [info['doc'] for key, info in final_docs]
@@ -220,6 +212,8 @@ class BM25SemanticHybridRetriever:
             log.error(f"Semantic retrieval failed: {e}")
             return []
     
+
+
     def _combine_scores_rrf(
         self,
         bm25_docs: List[Document],
@@ -227,65 +221,142 @@ class BM25SemanticHybridRetriever:
         k: int = 60
     ) -> Dict[str, Dict[str, float]]:
         """
-        Combine BM25 and semantic rankings using RRF (Reciprocal Rank Fusion).
-        
-        RRF formula: score(d) = sum(1 / (k + rank(d, retriever)))
-        
-        This approach:
-        - Treats each retriever as a ranking source (rank 1, 2, 3, ...)
-        - Gives equal weight to good rankings from either source
-        - Is more robust than score averaging to scale differences
+        Combine BM25 and Semantic rankings using RRF (Reciprocal Rank Fusion).
         
         Args:
-            bm25_docs: Documents from BM25 retriever in rank order
-            semantic_docs: Documents from semantic retriever in rank order
-            k: Constant for RRF (typically 60), prevents rank=0 issues
+            bm25_docs: Documents from BM25 retriever
+            semantic_docs: Documents from Semantic retriever
+            k: Constant for RRF (typically 60)
         
         Returns:
-            Dict mapping document content to {'doc': doc, 'bm25_rank': int, 'semantic_rank': int, 'rrf_score': float}
+            Dict mapping document content to {'doc': doc, 'rrf_score': float, ...}
         """
         combined = {}
         
-        # Process BM25 results with ranks (1-indexed)
-        for rank, doc in enumerate(bm25_docs, start=1):
-            doc_key = doc.page_content[:200]  # Use content as key
-            
-            if doc_key not in combined:
-                combined[doc_key] = {
-                    'doc': doc, 
-                    'bm25_rank': None, 
-                    'semantic_rank': None,
-                    'rrf_score': 0.0
-                }
-            
-            combined[doc_key]['bm25_rank'] = rank
-        
-        # Process semantic results with ranks (1-indexed)
-        for rank, doc in enumerate(semantic_docs, start=1):
-            doc_key = doc.page_content[:200]  # Use content as key
-            
-            if doc_key not in combined:
-                combined[doc_key] = {
-                    'doc': doc, 
-                    'bm25_rank': None, 
-                    'semantic_rank': None,
-                    'rrf_score': 0.0
-                }
-            
-            combined[doc_key]['semantic_rank'] = rank
+        # Helper to process a list of docs
+        def process_docs(docs, content_key_len=200, source_name="bm25"):
+            for rank, doc in enumerate(docs, start=1):
+                doc_key = doc.page_content[:content_key_len]
+                if doc_key not in combined:
+                    combined[doc_key] = {
+                        'doc': doc, 
+                        'bm25_rank': None, 
+                        'semantic_rank': None,
+                        'rrf_score': 0.0
+                    }
+                combined[doc_key][f'{source_name}_rank'] = rank
+
+        # Process all sources
+        process_docs(bm25_docs, source_name="bm25")
+        process_docs(semantic_docs, source_name="semantic")
         
         # Calculate RRF scores
         for key in combined:
             rrf_score = 0.0
+            info = combined[key]
             
-            # Add contribution from BM25 rank if available
-            if combined[key]['bm25_rank'] is not None:
-                rrf_score += 1.0 / (k + combined[key]['bm25_rank'])
-            
-            # Add contribution from semantic rank if available
-            if combined[key]['semantic_rank'] is not None:
-                rrf_score += 1.0 / (k + combined[key]['semantic_rank'])
+            if info['bm25_rank']: rrf_score += 1.0 / (k + info['bm25_rank'])
+            if info['semantic_rank']: rrf_score += 1.0 / (k + info['semantic_rank'])
             
             combined[key]['rrf_score'] = rrf_score
         
         return combined
+
+
+class Neo4jVectorRetriever:
+    """
+    Retriever that uses Neo4j Vector Index to find relevant nodes.
+    Separated from the Hybrid Retriever to allow for Agentic selection.
+    """
+    def __init__(self, neo4j_graph, embeddings, k: int = 5):
+        self.neo4j_graph = neo4j_graph
+        self.embeddings = embeddings
+        self.k = k
+    
+    def get_relevant_documents(self, query: str, selected_files: List[str] = None) -> List[Document]:
+        """Retrieve documents using Neo4j Graph Vector Index, optionally filtering by filename."""
+        if not self.neo4j_graph:
+            log.warning("Neo4j Graph not initialized.")
+            return []
+        
+        try:
+            # 1. Calculate query embedding
+            query_embedding = self.embeddings.embed_query(query)
+            
+            # 2. Key: Neo4j Vector Index search isn't easily compatible with pre-filtering in LangChain's existing wrapper
+            # But since we use raw Cypher here, we can simple post-filter or try to pre-filter if index allows.
+            # Neo4j vector index query `db.index.vector.queryNodes` doesn't support filter directly in the procedure call.
+            # We must fetch more and filter, or use the new `queryNodes` signature in 5.x if available, 
+            # Or use post-filtering (WHERE node.source in list) which is less efficient if k is small.
+            
+            # Strategy: Fetch k*4 candidates, then filter.
+            
+            k_to_fetch = self.k * 2
+            if selected_files:
+                k_to_fetch = self.k * 5 # Fetch more if filtering
+            
+            query_cypher = """
+            CALL db.index.vector.queryNodes('movie_text_embeddings', $k, $embedding)
+            YIELD node, score
+            """
+            
+            params = {
+                "k": k_to_fetch, 
+                "embedding": query_embedding
+            }
+            
+            # Add filtering
+            if selected_files:
+                # Assuming 'source' property holds filename or path
+                # We need to match how it's stored. GraphIndexer stores 'source' in metadata.
+                # In add_graph_documents, include_source=True adds 'source' property to Document node.
+                query_cypher += """
+                WHERE any(file IN $selected_files WHERE node.source CONTAINS file)
+                """
+                params["selected_files"] = selected_files
+            
+            query_cypher += """
+            // Traversal: Find connected entities
+            MATCH (node)-[r:MENTIONS]->(e)
+            WITH node, score, collect(e) as entity_nodes, collect(r) as rels
+            
+            // Format Output
+            RETURN 
+                "Related Entities: " + apoc.text.join([e in entity_nodes | e.id], ", ") + "\n\n" + node.text AS text,
+                node.source AS source, 
+                score, 
+                elementId(node) as id,
+                {
+                    nodes: [n in entity_nodes + [node] | {id: elementId(n), labels: labels(n), properties: properties(n)}],
+                    relationships: [rel in rels | {id: elementId(rel), type: type(rel), startNode: elementId(startNode(rel)), endNode: elementId(endNode(rel)), properties: properties(rel)}]
+                } as graph_data
+            LIMIT $final_k
+            """
+            params["final_k"] = self.k
+            
+            results = self.neo4j_graph.query(query_cypher, params=params)
+            
+            # 3. Convert to Documents
+            docs = []
+            for res in results:
+                page_content = res.get('text', '')
+                source = res.get('source', 'graph')
+                metadata = {
+                    'source': source, 
+                    'filename': source if source != 'graph' else 'neo4j_graph', 
+                    'graph_score': res.get('score'), 
+                    'id': res.get('id'),
+                    'graph_data': res.get('graph_data') # Include graph structure
+                }
+                doc = Document(page_content=page_content, metadata=metadata)
+                docs.append(doc)
+                
+            log.info(f"Graph vector retrieval returned {len(docs)} documents (filtered={bool(selected_files)})")
+            return docs
+
+        except Exception as e:
+            log.error(f"Graph retrieval failed: {e}")
+            return []
+            
+    async def aget_relevant_documents(self, query: str) -> List[Document]:
+        return self.get_relevant_documents(query)

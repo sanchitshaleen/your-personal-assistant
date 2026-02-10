@@ -52,7 +52,7 @@ def get_logger(
     # Console Handler
     if log_to_console:
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.WARNING)
+        console_handler.setLevel(logging.DEBUG)  # Changed from WARNING to DEBUG
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
 

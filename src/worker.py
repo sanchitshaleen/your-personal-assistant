@@ -34,8 +34,8 @@ logger = get_task_logger(__name__)
 
 
 @app.task(bind=True, name='ingest_file_task', soft_time_limit=1800, time_limit=2000)
-def ingest_file_task(self, user_id: str, file_name: str, collection_name: str = "documents", embedding_model: str = None):
-    """Background task to ingest a file into the vector database.
+def ingest_file_task(self, user_id: str, file_name: str, collection_name: str = "documents", embedding_model: str = None, use_graph: bool = False):
+    """Background task to ingest a file into the vector database and optionally Graph DB.
     
     Implements idempotency to prevent duplicate embeddings:
     - Checks if file is already embedded (status='completed')
@@ -48,6 +48,7 @@ def ingest_file_task(self, user_id: str, file_name: str, collection_name: str = 
         file_name: Filename (with folder path if applicable, e.g. "test_1/file.pdf")
         collection_name: Qdrant collection name
         embedding_model: Embedding model name (optional)
+        use_graph: Whether to identify entities and ingest into Neo4j Graph DB (Slower)
         
     Returns:
         dict: Status, document IDs, and message
@@ -56,6 +57,8 @@ def ingest_file_task(self, user_id: str, file_name: str, collection_name: str = 
     
     from src.rag.indexer import ingest_file
     from src.rag.vector_store import VectorDB
+    from src.rag.graph_indexer import GraphIndexer
+    from src.core.llm import get_llm
     from config import settings as config
     from src.core import database as pg_db
     from src.processing import files
@@ -138,12 +141,133 @@ def ingest_file_task(self, user_id: str, file_name: str, collection_name: str = 
         )
         logger.info(f"[TASK {self.request.id}] Running ingest_file for '{file_path}'")
         
-        status, doc_ids, message = ingest_file(
-            user_id=user_id,
-            file_path=file_path,
-            vectorstore=vector_db,
-            embeddings=vector_db.get_embeddings()
+        
+        # Initialize LLM for summarization (Common capability)
+        llm_summary = get_llm(
+            model_name=config.LLM_SUMMARY_MODEL_NAME, 
+            context_size=8192, 
+            temperature=config.LLM_SUMMARY_TEMPERATURE
         )
+
+        # === EXCLUSIVE PATH SELECTION ===
+        if use_graph and config.GRAPH_INGESTION_ENABLED:
+            logger.info(f"[TASK {self.request.id}] EXCLUSIVE MODE: Graph DB selected. Skipping Qdrant ingestion.")
+            
+            # 1. Load Documents (Reusing logic for Graph Path)
+            from langchain_community.document_loaders import PyMuPDFLoader, TextLoader, UnstructuredMarkdownLoader
+            from src.utils.splitter import split_text 
+            # Note: We still use splitter to get manageable chunks for Graph, 
+            # or we can pass full docs to LLMGraphTransformer (which chunks internally? No, better to chunk first).
+            
+            docs = []
+            lower_path = file_path.lower()
+            try:
+                if lower_path.endswith(".pdf"):
+                    loader = PyMuPDFLoader(file_path)
+                    docs = loader.load()
+                elif lower_path.endswith(".md"):
+                    loader = UnstructuredMarkdownLoader(file_path)
+                    docs = loader.load()
+                elif lower_path.endswith(".txt"):
+                    loader = TextLoader(file_path)
+                    docs = loader.load()
+                
+                if not docs:
+                     raise ValueError("No content loaded from file")
+                     
+            except Exception as load_e:
+                logger.error(f"Failed to load file for Graph: {load_e}")
+                return {
+                    'status': 'failed',
+                    'doc_ids': [],
+                    'message': f"Failed to load file: {load_e}",
+                    'user_id': user_id
+                }
+
+            # 2. Generate Summary (Independent of Qdrant)
+            summary_text = None
+            try:
+                full_text = " ".join([d.page_content for d in docs])[:20000]
+                from langchain_core.prompts import ChatPromptTemplate
+                from langchain_core.output_parsers import StrOutputParser
+                
+                prompt = ChatPromptTemplate.from_template(
+                    "Summarize the following document content in 3-5 sentences. "
+                    "Focus on the main topics, entities, and purpose of the document.\n\n"
+                    "Content:\n{content}"
+                )
+                chain = prompt | llm_summary | StrOutputParser()
+                summary_text = chain.invoke({"content": full_text})
+                logger.info(f"Generated summary for Graph file: {summary_text}")
+            except Exception as sum_e:
+                logger.warning(f"Failed to generate summary: {sum_e}")
+
+            # 3. Ingest into Neo4j (Graph Only)
+            try:
+                 # Init LLM for extraction
+                llm_chat = get_llm(
+                    model_name=config.GRAPH_LLM_MODEL_NAME, 
+                    context_size=8192, 
+                    temperature=0, 
+                    verify_connection=False
+                )
+                
+                # GraphIndexer - using embeddings from VectorDB config (even if not using Qdrant DB)
+                # We need embeddings object to embed text within Neo4j
+                embeddings = vector_db.get_embeddings()
+                
+                graph_indexer = GraphIndexer(
+                    llm=llm_chat,
+                    embeddings=embeddings
+                )
+                
+                self.update_state(
+                    state='PROGRESS',
+                    meta={'current': 60, 'total': 100, 'status': 'Ingesting into Neo4j Knowledge Graph...'}
+                )
+                
+                # Use LangChain splitter to chunk documents for graph ingestion
+                # LLMGraphTransformer is slow on large docs, better to chunk first.
+                from langchain.text_splitter import RecursiveCharacterTextSplitter
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=config.DOC_CHAR_LIMIT,
+                    chunk_overlap=config.DOC_OVERLAP_NO
+                )
+                split_docs = splitter.split_documents(docs)
+                logger.info(f"Split into {len(split_docs)} chunks for graph extraction")
+                
+                # Pass parameters for summary creation
+                success = graph_indexer.index_documents(
+                    split_docs,
+                    llm_summary=llm_summary,
+                    qdrant_client=vector_db.db.client,  # Get Q drant client from VectorDB
+                    user_id=user_id,
+                    file_path=file_path
+                )
+                
+                if not success:
+                    raise Exception("Graph Indexer returned False")
+                    
+                doc_ids = ["graph_ingested"] # Placeholder as we don't track chunk IDs same way
+                status = True
+                message = "Ingested into Neo4j Graph successfully with document summary."
+                
+            except Exception as graph_e:
+                logger.error(f"Graph Ingestion fatal error: {graph_e}")
+                status = False
+                message = f"Graph Ingestion failed: {graph_e}"
+                doc_ids = []
+
+        else:
+            # === STANDARD PATH (Qdrant) ===
+            logger.info(f"[TASK {self.request.id}] STANDARD MODE: Hybrid (Qdrant) ingestion.")
+            status, doc_ids, message, summary_text = ingest_file(
+                user_id=user_id,
+                file_path=file_path,
+                vectorstore=vector_db,
+                embeddings=vector_db.get_embeddings(),
+                llm_summary=llm_summary
+            )
         
         if status:
             # Update progress
@@ -152,33 +276,30 @@ def ingest_file_task(self, user_id: str, file_name: str, collection_name: str = 
                 meta={'current': 80, 'total': 100, 'status': 'Storing metadata...'}
             )
             
-            # Store embedding metadata in PostgreSQL
-            logger.info(f"[TASK {self.request.id}] Storing {len(doc_ids)} embeddings in PostgreSQL for file {file_id}")
             
-            for vid in doc_ids:
-                pg_db.add_embedding(file_id=file_id, vector_id=vid)
+            # Store embedding metadata in PostgreSQL using ATOMIC update
+            logger.info(f"[TASK {self.request.id}] Storing metadata in PostgreSQL for file {file_id}")
             
-            # Update chunk count
-            pg_db.update_file_chunk_count(file_id=file_id, chunk_count=len(doc_ids), user_id=user_id)
+            pg_db.update_file_success(
+                file_id=file_id, 
+                doc_ids=doc_ids, 
+                summary=summary_text
+            )
             
-            # Mark file as available (embeddings ready for querying)
-            logger.info(f"[TASK {self.request.id}] Marking file as available after embedding")
+            # Set ingestion target based on mode
             try:
-                # Update the uploads table to mark file as available
-                import psycopg2
+                ingestion_target = 'neo4j' if (use_graph and config.GRAPH_INGESTION_ENABLED) else 'qdrant'
                 with pg_db.get_connection() as conn:
                     cur = conn.cursor()
                     cur.execute("""
-                        UPDATE uploads SET available = 1
-                        WHERE file_id = %s AND user_id = %s
-                    """, (file_id, user_id))
+                        UPDATE uploads 
+                        SET ingestion_target = %s
+                        WHERE file_id = %s
+                    """, (ingestion_target, file_id))
                     conn.commit()
-                    logger.info(f"[TASK {self.request.id}] File marked as available: {file_id}")
+                logger.info(f"[TASK {self.request.id}] Set ingestion_target={ingestion_target} for file {file_id}")
             except Exception as e:
-                logger.error(f"[TASK {self.request.id}] Error marking file as available: {e}")
-            
-            # Mark embedding as completed
-            pg_db.set_embedding_status(file_id, 'completed')
+                logger.error(f"Failed to set ingestion_target: {e}")
             
             # Final update
             self.update_state(
@@ -186,17 +307,31 @@ def ingest_file_task(self, user_id: str, file_name: str, collection_name: str = 
                 meta={'current': 100, 'total': 100, 'status': 'Complete!'}
             )
             
-            logger.info(f"[TASK {self.request.id}] Ingestion completed successfully for '{file_name}' ({len(doc_ids)} embeddings)")
+            logger.info(f"[TASK {self.request.id}] Ingestion completed successfully for '{file_name}'")
             return {
                 'status': 'success',
                 'doc_ids': doc_ids,
-                'message': f"Ingested {len(doc_ids)} documents successfully.",
+                'message': message,
                 'user_id': user_id,
                 'file_name': file_name
             }
         else:
-            # Mark embedding as failed
+            # Mark embedding as failed and store error message
             pg_db.set_embedding_status(file_id, 'failed')
+            
+            # Store error message in uploads table
+            try:
+                with pg_db.get_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE uploads 
+                        SET error_message = %s
+                        WHERE file_id = %s
+                    """, (str(message)[:500], file_id))  # Truncate to 500 chars
+                    conn.commit()
+            except Exception as e:
+                logger.error(f"Failed to store error message: {e}")
+            
             logger.error(f"[TASK {self.request.id}] Ingestion failed: {message}")
             return {
                 'status': 'failed',

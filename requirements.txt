@@ -23,6 +23,11 @@ flower==2.0.1  # Celery monitoring and administration UI
 torch>=2.0.0  # PyTorch for Qwen3 reranker inference
 transformers>=4.40.0  # Hugging Face transformers for Qwen3-Reranker-0.6B
 
+# Graph RAG Dependencies:
+neo4j>=5.18.0
+langchain-experimental>=0.0.57
+langchain-neo4j>=0.0.1  # For Neo4jGraph compatibility
+langgraph               # For Agentic RAG Planner
 
 # Backend Req: One of these two as per your convenience:
 # I have used ollama for 'dev' and google-genai for 'deploy'

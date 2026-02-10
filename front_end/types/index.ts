@@ -11,6 +11,7 @@ export interface UploadedFile {
   available: number;
   embedding_status?: 'pending' | 'in_progress' | 'completed' | 'failed';
   embedding_model?: string;
+  error_message?: string;
 }
 
 export interface Message {

@@ -2,22 +2,30 @@
 # uvicorn server:app --reload
 # Avoid using --reload flag, because, LLMs will keep reloading and system will overheat.
 
-from fastapi import FastAPI, File, UploadFile, Form, Request, Query
+from fastapi import FastAPI, File, UploadFile, Form, Request, Query, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 import json
 import time
 import asyncio
-from typing import Optional
-from pydantic import BaseModel
+import os
 from contextlib import asynccontextmanager
+from typing import List, Optional, Dict
+
+from src.core.logger import get_logger
+log = get_logger("main")
+log.info("🚀 RAG Service Initialized with Agentic Planner Integration")
 
 # llm system imports:
-from src.core.llm import get_llm, get_output_parser  # Functions
-from src.core.llm import get_dummy_response          # Function
-from src.core.llm import get_dummy_response_stream   # Function
-from src.rag.vector_store import VectorDB               # Class
+from src.core.llm import get_llm, get_output_parser
+from src.core.llm import get_dummy_response
+from src.core.llm import get_dummy_response_stream
+from src.rag.vector_store import VectorDB
+from langchain_core.messages import HumanMessage
+from config import settings as config
+from config import settings as config
 from src.core.history import HistoryStore, redis_client  # Class
 from src.rag.cache import SemanticCache    # Class
 from src.core.cache_version import get_cache_version_manager  # Function
@@ -186,28 +194,52 @@ async def lifespan(app: FastAPI):
     app.state.history_store = HistoryStore()
 
     # Initialize retriever (BM25 hybrid or standard semantic)
-    if config.USE_BM25_SEMANTIC_HYBRID:
-        log.info("Initializing BM25 + SEMANTIC HYBRID retrieval (deterministic)...")
-        retriever = app.state.vector_db.get_bm25_semantic_hybrid_retriever(
-            bm25_weight=config.BM25_WEIGHT,
-            semantic_weight=config.SEMANTIC_WEIGHT
-        )
-        use_hybrid_for_chain = True
-    else:
-        log.info("Initializing standard SEMANTIC (vector-only) retrieval...")
-        retriever = app.state.vector_db.get_retriever()
-        use_hybrid_for_chain = False
-
-    # Store retriever for direct access
-    app.state.retriever = retriever
-
-    app.state.rag_chain = build_rag_chain(
-        llm_chat=app.state.llm_chat,
-        llm_summary=app.state.llm_summary,
-        retriever=retriever,
-        get_history_fn=app.state.history_store.get_session_history,
-        use_hybrid=use_hybrid_for_chain,
+    # Initialize retriever (BM25 hybrid or standard semantic)
+    # Always init Hybrid to pass to Graph
+    log.info("Initializing Hybrid Retrieval for Agent...")
+    hybrid_retriever = app.state.vector_db.get_bm25_semantic_hybrid_retriever(
+        bm25_weight=config.BM25_WEIGHT,
+        semantic_weight=config.SEMANTIC_WEIGHT
     )
+    # Init Neo4j if enabled
+    neo4j_retriever = app.state.vector_db.get_neo4j_retriever(k=config.DOCS_NUM_COUNT)
+    app.state.neo4j_retriever = neo4j_retriever # Store for direct access
+    
+    app.state.retriever = hybrid_retriever # For compatibility if needed
+
+    # Build Agentic RAG Graph
+    log.info("Building Agentic RAG Graph...")
+    from src.agent.graph import create_agentic_rag_graph
+    
+    agent_graph = None
+    try:
+        from langgraph.checkpoint.redis.asyncio import AsyncRedisSaver
+        redis_url = f"redis://{config.REDIS_HOST}:{config.REDIS_PORT}/{config.REDIS_DB}"
+        os.environ["REDIS_URL"] = redis_url # Critical for redisvl used internally by LangGraph
+        checkpointer = AsyncRedisSaver.from_conn_string(redis_url)
+        # Async setup is crucial for connection pool initialization
+        if hasattr(checkpointer, "asetup"):
+            await checkpointer.asetup()
+        log.info(f"✅ Initialized AsyncRedisSaver for Graph Memory: {redis_url}")
+        
+        agent_graph = create_agentic_rag_graph(
+            llm_chat=app.state.llm_chat,
+            hybrid_retriever=hybrid_retriever,
+            neo4j_retriever=neo4j_retriever,
+            checkpointer=checkpointer
+        )
+    except Exception as e:
+        log.warning(f"⚠️ Failed to init AsyncRedisSaver: {e}. Graph will use fallback MemorySaver.")
+        # Fallback
+        agent_graph = create_agentic_rag_graph(
+            llm_chat=app.state.llm_chat,
+            hybrid_retriever=hybrid_retriever,
+            neo4j_retriever=neo4j_retriever
+        )
+    
+    # Use agent graph directly - the checkpointer handles memory automatically!
+    # No need for RunnableWithMessageHistory wrapper with LangGraph
+    app.state.rag_chain = agent_graph
 
     # Initialize cache version manager for invalidation detection
     cache_version_mgr = get_cache_version_manager()
@@ -548,14 +580,90 @@ async def rag_chat(request: Request, chat_request: RAGChatRequest):
             rag_chain: Runnable = request.app.state.rag_chain
             history_store: HistoryStore = request.app.state.history_store
             retriever = request.app.state.retriever
+            neo4j_retriever = getattr(request.app.state, 'neo4j_retriever', None)
             
-            print(f"[DEBUG] Starting retrieval for query: {query[:50]}")
+            print(f"[DEBUG] Starting V2 retrieval for query: {query[:50]}")
+            print("STEP 1: About to import planner")
             
             # Get timing breakpoints
             retrieval_start = time.time()
             
-            # Manually retrieve documents to capture chunks
-            retrieved_docs = retriever.retrieve_hybrid(query, selected_files)
+            # --- FILE-AWARE STRATEGY SELECTION ---
+            # If user explicitly selected files, force strategy based on where those files are stored
+            forced_strategy = None
+            if selected_files:
+                print(f"[DEBUG] Files explicitly selected: {selected_files}. Checking ingestion targets...")
+                try:
+                    file_targets = []
+                    for filename in selected_files:
+                        file_id = pg_db.get_file_id_by_name(user_id=session_id, file_name=filename)
+                        if file_id != -1:
+                            target = pg_db.get_ingestion_target(file_id)
+                            file_targets.append(target)
+                            print(f"[DEBUG] File '{filename}' ingestion_target: {target}")
+                    
+                    # Determine forced strategy based on file targets
+                    if file_targets:
+                        if all(t == 'neo4j' for t in file_targets):
+                            forced_strategy = 'graph'
+                            print(f"[DEBUG] All selected files are in Neo4j. Forcing strategy='graph'.")
+                        elif all(t == 'qdrant' for t in file_targets):
+                            forced_strategy = 'hybrid'
+                            print(f"[DEBUG] All selected files are in Qdrant. Forcing strategy='hybrid'.")
+                        else:  # Mix of targets or 'both'
+                            forced_strategy = 'both'
+                            print(f"[DEBUG] Mixed ingestion targets. Forcing strategy='both'.")
+                except Exception as e:
+                    print(f"[WARN] Failed to check ingestion targets: {e}. Will use Planner.")
+            
+            # --- PLANNER INTEGRATION (Only if no forced strategy) ---
+            if forced_strategy:
+                strategy = forced_strategy
+                print(f"[DEBUG] Using forced strategy: {strategy} (file explicitly selected)")
+            else:
+                print(f"[DEBUG] No files selected or unable to determine target. Using Planner.")
+                from src.agent.planner import create_retrieval_planner, get_document_summaries
+                
+                # 1. Fetch Summaries
+                summaries_context = "No summaries available."
+                try:
+                    if retriever and retriever.qdrant_client:
+                        summaries_context = get_document_summaries(
+                            query=query,
+                            qdrant_client=retriever.qdrant_client,
+                            embeddings=retriever.embeddings
+                        )
+                except Exception as e:
+                    print(f"[WARN] Failed to fetch summaries for planner: {e}")
+
+                # 2. Plan Strategy
+                try:
+                    planner = create_retrieval_planner(llm_model=config.LLM_CHAT_MODEL_NAME)
+                    plan = planner.invoke({
+                        "query": query,
+                        "summaries": summaries_context
+                    })
+                    strategy = plan.strategy
+                    print(f"[DEBUG] Planner Strategy: {strategy} (Reason: {plan.reasoning})")
+                except Exception as e:
+                    print(f"[WARN] Planner failed, defaulting to hybrid: {e}")
+                    strategy = "hybrid"
+
+            # 3. Execute Retrieval
+            retrieved_docs = []
+            if strategy == "graph" and neo4j_retriever:
+                print("[DEBUG] Executing Graph Retrieval")
+                # Pass selected_files as kwarg (handled by custom get_relevant_documents or wrapper)
+                retrieved_docs = neo4j_retriever.get_relevant_documents(query, selected_files=selected_files)
+            elif strategy == "both" and neo4j_retriever:
+                print("[DEBUG] Executing Hybrid + Graph Retrieval")
+                hybrid_docs = retriever.retrieve_hybrid(query, selected_files)
+                graph_docs = neo4j_retriever.get_relevant_documents(query, selected_files=selected_files)
+                retrieved_docs = hybrid_docs + graph_docs
+            else:
+                print("[DEBUG] Executing Hybrid Retrieval")
+                retrieved_docs = retriever.retrieve_hybrid(query, selected_files)
+
             retrieval_time = round(time.time() - retrieval_start, 2)
             
             print(f"[DEBUG] Retrieved {len(retrieved_docs)} documents in {retrieval_time}s")
@@ -563,6 +671,13 @@ async def rag_chat(request: Request, chat_request: RAGChatRequest):
             # Send retrieved chunks immediately
             chunks_data = []
             for i, doc in enumerate(retrieved_docs, 1):
+                print(f"[DEBUG] Processing doc #{i}: metadata={doc.metadata}")
+                
+                # Filter out system initialization docs
+                if doc.metadata.get('skip_in_search'):
+                    print(f"[DEBUG] Skipping doc #{i}: has skip_in_search flag")
+                    continue
+                    
                 # Clean up content: strip whitespace, normalize spaces, collapse newlines
                 content = doc.page_content[:500]
                 content = ' '.join(content.split())  # Normalize whitespace
@@ -572,15 +687,24 @@ async def rag_chat(request: Request, chat_request: RAGChatRequest):
                 # Get source document name
                 source = doc.metadata.get('source', doc.metadata.get('filename', 'unknown'))
                 
-                print(f"[DEBUG] Chunk #{i}: source={source}, content_length={len(content)}, raw_length={len(doc.page_content)}")
-                print(f"[DEBUG] Chunk #{i} content preview: {content[:100]}")
+                print(f"[DEBUG] Doc #{i}: source='{source}', content_length={len(content)}, first_50_chars='{content[:50]}'")
+                
+                # Filter out "unknown" sources if they are empty/garbage
+                if source == 'unknown' and len(content) < 5:
+                    print(f"[DEBUG] Skipping doc #{i}: unknown source with short content (len={len(content)})")
+                    continue
+                
+                print(f"[DEBUG] Chunk #{i}: source={source}, content_length={len(content)}, raw_length={len(doc.page_content)} - KEEPING THIS ONE")
                 
                 chunks_data.append({
                     "rank": i,
                     "filename": doc.metadata.get('filename', 'unknown'),
                     "source": source,
                     "content": content if content else "(empty content)",
-                    "metadata": {k: v for k, v in doc.metadata.items() if k != 'embedding'}
+                    "metadata": {
+                        **{k: v for k, v in doc.metadata.items() if k not in ['embedding', 'source', 'filename']},
+                        "score": doc.metadata.get('graph_score') or doc.metadata.get('rrf_score') or doc.metadata.get('semantic_score') or 0.0
+                    }
                 })
             
             print(f"[DEBUG] Prepared {len(chunks_data)} chunks for sending")
@@ -595,10 +719,13 @@ async def rag_chat(request: Request, chat_request: RAGChatRequest):
             
             print(f"[DEBUG] Sent chunks data to client")
             
-            # Configure the chain with selected files
-            config = {
+            # Configure with thread_id for LangGraph checkpointer
+            # The checkpointer automatically handles loading/saving messages
+            # checkpoint_ns is required for AsyncRedisSaver to function correctly!
+            run_config = {
                 "configurable": {
-                    "session_id": session_id,
+                    "thread_id": session_id,  # LangGraph uses thread_id for memory
+                    "checkpoint_ns": "",      # Required by AsyncRedisSaver
                     "selected_files": selected_files
                 }
             }
@@ -607,27 +734,42 @@ async def rag_chat(request: Request, chat_request: RAGChatRequest):
             llm_start = time.time()
             full_response = ""
             chunk_count = 0
-            print(f"[DEBUG] Starting LLM streaming...")
+            
+            initial_state = {
+                "input": query,
+                "selected_files": selected_files,
+                "messages": [HumanMessage(content=query)]
+            }
+            
+            log.info(f"RAG Endpoint: Starting astream for query '{query[:50]}...' session '{session_id}'")
             try:
-                async for chunk in rag_chain.astream({"input": query}, config=config):
+                async for chunk in rag_chain.astream(initial_state, config=run_config):
                     chunk_count += 1
-                    print(f"[DEBUG] LLM chunk #{chunk_count} raw: {chunk}")
-                    if chunk_count == 1:
-                        print(f"[DEBUG] First LLM chunk received")
+                    # log.info(f"RAG Endpoint: Received chunk #{chunk_count}: {list(chunk.keys()) if isinstance(chunk, dict) else type(chunk)}")
+                    
                     if await request.is_disconnected():
                         log.warning(f"/rag client disconnected for '{session_id}'")
                         break
-                    # Extract answer from chunk
-                    if isinstance(chunk, dict) and "answer" in chunk:
-                        content = chunk["answer"]
-                        print(f"[DEBUG] LLM chunk #{chunk_count} content: {content[:100]}")
+                        
+                    # Extract answer from chunk (LangGraph yields node outputs)
+                    # Expected format: {'generator': {'answer': '...'}} OR just {'answer': '...'} properties
+                    
+                    content = None
+                    if isinstance(chunk, dict):
+                        # check for nested generator output
+                        if "generator" in chunk and isinstance(chunk["generator"], dict):
+                             content = chunk["generator"].get("answer")
+                        elif "answer" in chunk:
+                             content = chunk["answer"]
+                             
+                    if content:
+                        # print(f"[DEBUG] Yielding content: {content[:50]}...")
                         full_response += content
-                        print(f"[DEBUG] Yielding LLM chunk #{chunk_count} to client")
                         yield json.dumps({
                             "type": "content",
                             "data": content
                         }) + "\n"
-                        print(f"[DEBUG] Yielded LLM chunk #{chunk_count} to client")
+                        # print(f"[DEBUG] Yielded LLM chunk #{chunk_count} to client")
             except Exception as stream_error:
                 print(f"[ERROR] LLM streaming error: {stream_error}")
                 log.error(f"/rag LLM streaming error: {stream_error}", exc_info=True)
@@ -939,9 +1081,18 @@ async def check_file_status(user_id: str = Form(...), filename: str = Form(...))
 
 # Endpoint to receive file uploads:
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), user_id: str = Form(...)):
+async def upload_file(
+    file: UploadFile = File(...), 
+    user_id: str = Form(...),
+    use_graph: str = Form("false") # Received as string from FormData
+):
     log.info(f"/upload Received file: {file.filename} from user: {user_id}")
     filename = file.filename if file.filename else "unknown_file"
+    
+    # Convert use_graph string to boolean
+    use_graph_bool = use_graph.lower() == "true"
+    if use_graph_bool:
+        log.info(f"/upload Graph ingestion enabled for {filename}")
     
     try:
         # Ensure user exists in the database
@@ -958,120 +1109,94 @@ async def upload_file(file: UploadFile = File(...), user_id: str = Form(...)):
         # Validate file size
         max_size_mb = 500
         if file_size > max_size_mb * 1024 * 1024:
-            error_msg = f"File size ({file_size / 1024 / 1024:.1f}MB) exceeds maximum limit ({max_size_mb}MB)"
+            error_msg = f"File too large. Maximum size is {max_size_mb}MB"
             log.warning(f"/upload {error_msg} for user {user_id}")
-            return JSONResponse(
-                content={
-                    "error": error_msg,
-                    "error_type": "file_too_large",
-                    "max_size_mb": max_size_mb
-                },
-                status_code=413  # Payload Too Large
-            )
+            return JSONResponse(status_code=400, content={"error": error_msg})
 
-        status, message = files.save_file(
-            user_id=user_id,
-            file_value_binary=file_content,
-            file_name=filename
-        )
+        # Save the file to disk
+        success, saved_filename = files.save_file(user_id, file_content, filename)
+        
+        if not success:
+            error_msg = saved_filename  # save_file returns error message in second tuple element on failure
+            log.error(f"/upload Failed to save file: {error_msg}")
+            return JSONResponse(status_code=500, content={"error": f"Failed to save file: {error_msg}"})
+            
+        file_path = files.get_file_path(user_id, saved_filename)
+        log.info(f"/upload File saved successfully at {file_path}")
+        
+        # Extract metadata (creation time, modification time)
+        try:
+            # For uploaded files, we use current time as creation/mod time since we don't get original fs metadata
+            import datetime
+            created_at = datetime.datetime.now()
+            modified_at =  datetime.datetime.now()
+            
+            # If we wanted to be more precise we could try to get it from os.stat but it's just created
+            # stat = os.stat(file_path)
+            # created_at = datetime.datetime.fromtimestamp(stat.st_ctime)
+            # modified_at = datetime.datetime.fromtimestamp(stat.st_mtime)
+            
+        except Exception as meta_err:
+            log.warning(f"/upload Failed to extract metadata: {str(meta_err)}, using current time")
+            import datetime
+            created_at = datetime.datetime.now()
+            modified_at = datetime.datetime.now()
 
-        if status:
-            filename = message
-            # Get the file path for metadata extraction
-            file_path = files.get_file_path(user_id=user_id, file_name=filename)
-            
-            # Extract source creation date from document metadata
-            try:
-                source_created_at = metadata_extractor.extract_source_creation_date(file_path, file_type)
-            except Exception as meta_err:
-                log.warning(f"/upload Failed to extract metadata: {str(meta_err)}, using current time")
-                source_created_at = None
-            
-            pg_db.add_file(
+        # Add file entry to database
+        try:
+            file_id = pg_db.add_file(
                 user_id=user_id, 
-                filename=filename, 
-                file_size=file_size, 
-                file_type=file_type, 
-                file_path=file_path,
-                source_created_at=source_created_at,
-                source='manual'
+                filename=saved_filename, 
+                file_size=file_size,
+                file_type=file_type
             )
+            log.info(f"/upload Added file entry to DB: ID={file_id}")
+        except Exception as db_err:
+            # Check for duplicate
+            if "unique constraint" in str(db_err).lower() or "already exists" in str(db_err).lower():
+                log.info(f"/upload File entry already exists in DB, retrieving ID...")
+                file_id = pg_db.get_file_id_by_name(user_id, saved_filename)
+                if file_id == -1:
+                    raise db_err
+            else:
+                raise db_err
+
+        # Trigger background IDEMPOTENT ingestion task
+        try:
+            task = ingest_file_task.delay(
+                user_id=user_id,
+                file_name=saved_filename,
+                collection_name=config.QDRANT_COLLECTION_NAME,
+                embedding_model=config.EMB_MODEL_NAME,
+                use_graph=use_graph_bool
+            )
+            log.info(f"/upload Auto-triggered embedding task {task.id} for {filename} (Graph={use_graph_bool})")
             
-            # Auto-trigger embedding task after successful upload
-            try:
-                task = ingest_file_task.delay(user_id=user_id, file_name=filename)
-                log.info(f"/upload Auto-triggered embedding task {task.id} for {filename}")
-                embedding_status = "embedding_queued"
-                task_id = task.id
-            except Exception as embed_err:
-                log.error(f"/upload Failed to queue embedding task: {str(embed_err)}", exc_info=True)
-                embedding_status = "embedding_failed"
-                task_id = None
+            return {
+                "message": "File uploaded successfully", 
+                "filename": saved_filename,
+                "file_id": file_id,
+                "task_id": str(task.id),
+                "status": "uploaded",
+                "embedding_status": "embedding_queued"
+            }
             
+        except Exception as embed_err:
+            log.error(f"/upload Failed to queue embedding task: {str(embed_err)}", exc_info=True)
             return JSONResponse(
+                status_code=202, 
                 content={
-                    "message": filename,
-                    "file_size": file_size,
-                    "file_type": file_type,
-                    "status": "uploaded",
-                    "embedding_status": embedding_status,
-                    "task_id": task_id
-                },
-                status_code=200
+                    "message": "File uploaded but auto-ingestion failed to start. Please try manually.",
+                    "filename": saved_filename,
+                    "file_id": file_id,
+                    "error": str(embed_err)
+                }
             )
-        else:
-            error_msg = f"Failed to save file: {message}"
-            log.error(f"/upload {error_msg} for user {user_id}")
-            return JSONResponse(
-                content={
-                    "error": error_msg,
-                    "error_type": "save_failed"
-                },
-                status_code=500
-            )
-    except ValueError as e:
-        error_msg = f"Invalid input: {str(e)}"
-        log.error(f"/upload {error_msg}", exc_info=True)
-        return JSONResponse(
-            content={
-                "error": error_msg,
-                "error_type": "invalid_input"
-            },
-            status_code=400
-        )
-    except IOError as e:
-        error_msg = "Disk I/O error while saving file. Check available disk space."
-        log.error(f"/upload {error_msg}: {str(e)}", exc_info=True)
-        return JSONResponse(
-            content={
-                "error": error_msg,
-                "error_type": "io_error",
-                "details": str(e)
-            },
-            status_code=507  # Insufficient Storage
-        )
+
     except Exception as e:
-        error_str = str(e).lower()
-        error_type = "upload_error"
-        error_msg = f"Upload failed: {str(e)}"
-        
-        if "database" in error_str or "postgresql" in error_str:
-            error_type = "database_error"
-            error_msg = "Failed to save file metadata to database. Please try again."
-        elif "permission" in error_str:
-            error_type = "permission_denied"
-            error_msg = "Permission denied. Check file permissions."
-        
+        error_msg = f"Unexpected error during upload"
         log.error(f"/upload {error_msg} | Original error: {str(e)}", exc_info=True)
-        return JSONResponse(
-            content={
-                "error": error_msg,
-                "error_type": error_type,
-                "details": str(e)
-            },
-            status_code=500
-        )
-        return JSONResponse(content={"error": message}, status_code=500)
+        return JSONResponse(status_code=500, content={"error": f"{error_msg}: {str(e)}"})
 
 
 @app.get("/uploads")
@@ -1179,19 +1304,94 @@ async def delete_file_endpoint(user_id: str = Query(...), filename: str = Query(
                 status_code=404
             )
         
+        # Get file metadata to determine ingestion target
+        with pg_db.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT ingestion_target FROM uploads WHERE file_id = %s",
+                (file_id,)
+            )
+            result = cur.fetchone()
+            ingestion_target = result[0] if result else 'qdrant'  # Default to qdrant if not set
+        
+        log.info(f"/delete_file File '{filename}' was ingested to: {ingestion_target}")
+        
         # Get embedding IDs associated with this file
         embedding_ids = pg_db.get_embeddings_by_file_id(file_id)
         log.info(f"/delete_file Found {len(embedding_ids)} embeddings for file '{filename}'")
         
-        # Delete from vector database (Qdrant)
-        if embedding_ids:
-            vs: VectorDB = app.state.vector_db
+        # Delete from appropriate vector database
+        if ingestion_target == 'neo4j':
+            # Delete from Neo4j Graph Database
             try:
-                deleted_count = vs.delete_documents(embedding_ids)
-                log.info(f"/delete_file Deleted {deleted_count} vectors from Qdrant for file '{filename}'")
-            except Exception as ve:
-                log.error(f"/delete_file Error deleting vectors from Qdrant: {ve}")
-                # Continue with database cleanup even if vector deletion fails
+                from langchain_community.graphs import Neo4jGraph
+                from config import settings as config
+                
+                graph = Neo4jGraph(
+                    url=config.NEO4J_URI,
+                    username=config.NEO4J_USERNAME,
+                    password=config.NEO4J_PASSWORD
+                )
+                
+                # Delete Document nodes and their relationships for this file
+                # This includes chunks that were ingested from this file
+                file_path = files.get_file_path(user_id=user_id, file_name=filename)
+                
+                # Delete all nodes that came from this source document
+                # LangChain stores source info in Document nodes
+                query = """
+                MATCH (d:Document)
+                WHERE d.source CONTAINS $filename OR d.text CONTAINS $filename
+                DETACH DELETE d
+                """
+                result = graph.query(query, params={"filename": filename})
+                log.info(f"/delete_file Deleted Neo4j graph nodes for file '{filename}'")
+                
+                # Also delete any entities extracted from this document
+                # (They have MENTIONS relationships to Document nodes)
+                orphan_cleanup = """
+                MATCH (n)
+                WHERE NOT (n)--()
+                DELETE n
+                """
+                graph.query(orphan_cleanup)
+                log.info(f"/delete_file Cleaned up orphaned Neo4j nodes")
+                
+            except Exception as neo4j_error:
+                log.error(f"/delete_file Error deleting from Neo4j: {neo4j_error}")
+                # Continue with other cleanup even if Neo4j fails
+        else:
+            # Delete from vector database (Qdrant)
+            if embedding_ids:
+                vs: VectorDB = app.state.vector_db
+                try:
+                    deleted_count = vs.delete_documents(embedding_ids)
+                    log.info(f"/delete_file Deleted {deleted_count} vectors from Qdrant for file '{filename}'")
+                except Exception as ve:
+                    log.error(f"/delete_file Error deleting vectors from Qdrant: {ve}")
+                    # Continue with database cleanup even if vector deletion fails
+        
+        # Delete document summary from Qdrant (applies to both ingestion targets)
+        try:
+            file_path = files.get_file_path(user_id=user_id, file_name=filename)
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            
+            vs: VectorDB = app.state.vector_db
+            # Delete summary by filtering on file_path
+            vs.db.client.delete(
+                collection_name="document_summaries",
+                points_selector=Filter(
+                    must=[
+                        FieldCondition(
+                            key="file_path",
+                            match=MatchValue(value=file_path)
+                        )
+                    ]
+                )
+            )
+            log.info(f"/delete_file Deleted document summary from Qdrant for file '{filename}'")
+        except Exception as summary_error:
+            log.warning(f"/delete_file Error deleting summary: {summary_error}")
         
         # Mark embeddings as removed in database
         if embedding_ids:
@@ -1210,7 +1410,7 @@ async def delete_file_endpoint(user_id: str = Query(...), filename: str = Query(
             return JSONResponse(
                 content={
                     "status": "success",
-                    "message": f"File '{filename}' deleted successfully",
+                    "message": f"File '{filename}' deleted successfully from {ingestion_target}",
                     "embeddings_deleted": len(embedding_ids)
                 },
                 status_code=200

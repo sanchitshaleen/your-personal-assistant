@@ -19,19 +19,17 @@ log = get_logger(name="core_ingestion")
 
 
 def ingest_file(user_id: str, file_path: str, vectorstore: VectorDB,
-                embeddings: Embeddings) -> tuple[bool, List[str], str]:
+                embeddings: Embeddings, llm_summary=None) -> tuple[bool, List[str], str, str]:
     """Ingest a file into the vector database. Returns the ids of vector embeddings stored in database.
 
     Args:
         file_path (str): The absolute path to the file to be ingested.
         db (VectorDB): The vector database instance.
         embeddings (Embeddings): The embeddings model to use for the documents.
+        llm_summary: Optional LLM model for summary generation.
 
     Returns:
-        tuple[bool, List[str], str]: A tuple containing:
-            - bool: True if ingestion was successful, False otherwise.
-            - List[str]: List of document IDs that were ingested.
-            - str: Message indicating the result of the ingestion.
+        tuple[bool, List[str], str, str]: status, doc_ids, message, summary_text
     """
 
     # Load the file and get its content as Document objects:
@@ -52,6 +50,69 @@ def ingest_file(user_id: str, file_path: str, vectorstore: VectorDB,
 
     # Add the split documents to the vector database:
     try:
+        # === NEW: GENERATE AND EMBED SUMMARY ===
+        summary_text = None
+        if llm_summary:
+            try:
+                log.info(f"Generating summary for file: {file_path}...")
+                # Create a simple chain for summarization
+                from langchain_core.prompts import ChatPromptTemplate
+                from langchain_core.output_parsers import StrOutputParser
+                
+                # Combine first 20000 chars roughly as context for summary
+                full_text = " ".join([d.page_content for d in documents])[:20000]
+                
+                prompt = ChatPromptTemplate.from_template(
+                    "Summarize the following document content in 3-5 sentences. "
+                    "Focus on the main topics, entities, and purpose of the document so a retrieval system knows when to select it.\n\n"
+                    "Content:\n{content}"
+                )
+                chain = prompt | llm_summary | StrOutputParser()
+                summary_text = chain.invoke({"content": full_text})
+                log.info(f"Generated summary: {summary_text}")
+                
+                # Embed successful summary
+                if summary_text:
+                    log.info("Embedding summary for Planner Agent...")
+                    summary_embedding = embeddings.embed_query(summary_text)
+                    
+                    # Store in Qdrant 'document_summaries' collection
+                    from qdrant_client.models import PointStruct
+                    summary_point = PointStruct(
+                        id=int(time.time() * 1000000), # Simple unique ID
+                        vector=summary_embedding,
+                        payload={
+                            "page_content": summary_text,
+                            "file_path": file_path,
+                            "user_id": user_id,
+                            "filename": file_path.split("/")[-1]
+                        }
+                    )
+                    
+                    # Ensure collection exists
+                    try:
+                        vectorstore.db.client.upsert(
+                            collection_name="document_summaries",
+                            points=[summary_point]
+                        )
+                    except Exception:
+                        # Create if doesn't exist
+                        try:
+                            vectorstore.db.client.recreate_collection(
+                                collection_name="document_summaries",
+                                vectors_config=vectorstore.db.client.get_collection(vectorstore.collection_name).config.params.vectors
+                            )
+                            vectorstore.db.client.upsert(
+                                collection_name="document_summaries",
+                                points=[summary_point]
+                            )
+                        except Exception as e:
+                            log.error(f"Failed to create/upsert document_summaries: {e}")
+
+            except Exception as e:
+                log.error(f"Failed to generate/store summary: {e}")
+
+
         log.info(f"Ingesting {len(split_docs)} documents with dense and sparse embeddings...")
         
         # CRITICAL FIX: Generate BOTH dense and sparse embeddings explicitly
@@ -206,13 +267,13 @@ def ingest_file(user_id: str, file_path: str, vectorstore: VectorDB,
         
         splade_status = f" + SPLADE sparse vectors" if sparse_vectors_list else ""
         log.info(f"Successfully added {len(split_docs)} documents with dense embeddings{splade_status} to Qdrant.")
-        return True, doc_ids, f"Ingested {len(split_docs)} documents successfully."
+        return True, doc_ids, f"Ingested {len(split_docs)} documents successfully.", summary_text
             
     except Exception as e:
         log.error(f"Failed to ingest documents into Qdrant: {e}")
         import traceback
         log.error(f"Traceback: {traceback.format_exc()}")
-        return False, [], f"Failed to ingest documents: {e}"
+        return False, [], f"Failed to ingest documents: {e}", None
 
 
 if __name__ == "__main__":
